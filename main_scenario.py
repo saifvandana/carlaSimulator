@@ -1,42 +1,89 @@
-import math
+"""
+Town04 Map Inspector
+====================
+Run this BEFORE Step 2 to identify:
+  - Good highway spawn points for the ego vehicle (lane 2)
+  - Waypoints on 3-lane highway sections
+  - Lane IDs and road IDs on the highway ring
+
+Output will tell us exactly which road_id / lane_id to use in Step 2.
+"""
 
 import carla
-import time
-import random
 
-c = carla.Client("127.0.0.1", 2000)
-c.set_timeout(5.0)
-world = c.load_world("Town05")
-world_map = world.get_map()
+CARLA_HOST = "localhost"
+CARLA_PORT = 2000
 
 
-# Test: freeze just one approach light and check if others in group change
-tl_ids = [5131, 5128, 5127]  # IDs may have changed — rescan first
-all_tls = world.get_actors().filter("traffic.traffic_light*")
+def main():
+    client = carla.Client(CARLA_HOST, CARLA_PORT)
+    client.set_timeout(10.0)
+    world    = client.load_world("Town04")
+    town_map = world.get_map()
 
-# Find by position
-approach = []
-positions = [(-140.4, -78.1), (-113.1, -78.9), (-61.1, -78.1)]
-for (tx, ty) in positions:
-    for tl in all_tls:
-        loc = tl.get_location()
-        if abs(loc.x - tx) < 2 and abs(loc.y - ty) < 2:
-            approach.append(tl)
-            print(f"Found: id={tl.id} at ({loc.x:.1f}, {loc.y:.1f}) "
-                  f"group={tl.get_group_traffic_lights()}")
+    print(f"\n[Inspector] Map: {town_map.name}")
+    print("=" * 60)
 
-print(f"\nFreezing {len(approach)} lights and setting GREEN...")
-for tl in approach:
-    # Freeze the whole group this light belongs to
-    for group_tl in tl.get_group_traffic_lights():
-        print(f"  Group member: id={group_tl.id} "
-              f"({group_tl.get_location().x:.1f}, {group_tl.get_location().y:.1f})")
-    tl.freeze(True)
-    tl.set_state(carla.TrafficLightState.Green)
+    # ── 1. All spawn points ───────────────────────────────────────
+    spawn_pts = town_map.get_spawn_points()
+    print(f"\n[Spawn Points] Total: {len(spawn_pts)}")
+    print(f"{'Index':<6} {'x':>8} {'y':>8} {'z':>6} {'yaw':>7}  road  lane")
+    print("-" * 60)
 
-print("\nWaiting 10s — check if lights stay green in CARLA...")
-time.sleep(10)
+    for i, sp in enumerate(spawn_pts):
+        wp = town_map.get_waypoint(sp.location,
+                                   project_to_road=True,
+                                   lane_type=carla.LaneType.Driving)
+        if wp:
+            print(f"[{i:>3}]  {sp.location.x:>8.1f} {sp.location.y:>8.1f} "
+                  f"{sp.location.z:>6.1f} {sp.rotation.yaw:>7.1f}°  "
+                  f"road={wp.road_id:<4} lane={wp.lane_id}")
+        else:
+            print(f"[{i:>3}]  {sp.location.x:>8.1f} {sp.location.y:>8.1f} "
+                  f"{sp.location.z:>6.1f} {sp.rotation.yaw:>7.1f}°  (no waypoint)")
 
-for tl in approach:
-    tl.freeze(False)
-print("Unfrozen.")
+    # ── 2. Find 3-lane road sections ─────────────────────────────
+    print("\n[3-Lane Roads] Scanning waypoints every 10 m ...")
+    print(f"{'road_id':<10} {'lane_id':<10} {'x':>8} {'y':>8} {'lane_width':>11}")
+    print("-" * 60)
+
+    seen_roads = {}   # road_id → set of lane_ids
+
+    # Sample waypoints across the whole map
+    all_wps = town_map.generate_waypoints(10.0)   # one every 10 m
+    for wp in all_wps:
+        rid = wp.road_id
+        lid = wp.lane_id
+        if rid not in seen_roads:
+            seen_roads[rid] = set()
+        seen_roads[rid].add(lid)
+
+    # Print roads that have 3 or more driving lanes
+    for rid, lids in sorted(seen_roads.items()):
+        if len(lids) >= 3:
+            # Sample a waypoint on this road to get coordinates
+            sample = next((w for w in all_wps if w.road_id == rid), None)
+            if sample:
+                print(f"road={rid:<6}  lanes={sorted(lids)}  "
+                      f"x={sample.transform.location.x:>8.1f}  "
+                      f"y={sample.transform.location.y:>8.1f}")
+
+    # ── 3. Detailed lane info for highway candidates ──────────────
+    print("\n[Lane Detail] Checking lane types on 3-lane roads ...")
+    print("-" * 60)
+    for rid, lids in sorted(seen_roads.items()):
+        if len(lids) >= 3:
+            for wp in all_wps:
+                if wp.road_id == rid:
+                    print(f"  road={rid}  lane={wp.lane_id:>3}  "
+                          f"type={wp.lane_type}  "
+                          f"width={wp.lane_width:.1f}m  "
+                          f"left_mark={wp.left_lane_marking.type}  "
+                          f"right_mark={wp.right_lane_marking.type}")
+                    break   # one sample per road is enough here
+
+    print("\n[Inspector] Done. Use the road_id and lane_ids above in Step 2.\n")
+
+
+if __name__ == "__main__":
+    main()
