@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Vehicle Data Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .dashboard {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        .gauge {
+            margin: 15px 0;
+            padding: 10px;
+            border-radius: 5px;
+            background-color: #f0f0f0;
+        }
+        .speed {
+            background-color: #e3f2fd;
+        }
+        .rpm {
+            background-color: #fff8e1;
+        }
+        .status {
+            background-color: #e8f5e9;
+        }
+        .warning {
+            color: #d32f2f;
+            font-weight: bold;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            50% { opacity: 0.5; }
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <h1>Vehicle Data Dashboard</h1>
+        <div class="gauge speed">
+            <h2>Speed</h2>
+            <div id="speed">0 km/h</div>
+        </div>
+        <div class="gauge rpm">
+            <h2>RPM</h2>
+            <div id="rpm">0</div>
+        </div>
+        <div class="gauge status">
+            <h2>Vehicle Status</h2>
+            <div>Gear: <span id="gear">1</span></div>
+            <div>In Lane: <span id="in_lane">Yes</span></div>
+            <div>Engine Temp: <span id="engine_temp">90</span>°C</div>
+            <div>Fuel Level: <span id="fuel_level">80</span>%</div>
+            <div id="warnings"></div>
+        </div>
+        <div id="connection-status" style="color: #666;">Connecting to server...</div>
+    </div>
+
+    <script>
+        const speedElement = document.getElementById('speed');
+        const rpmElement = document.getElementById('rpm');
+        const gearElement = document.getElementById('gear');
+        const inLaneElement = document.getElementById('in_lane');
+        const engineTempElement = document.getElementById('engine_temp');
+        const fuelLevelElement = document.getElementById('fuel_level');
+        const warningsElement = document.getElementById('warnings');
+        const connectionStatus = document.getElementById('connection-status');
+
+        // Connect to WebSocket server
+        const socket = new WebSocket('ws://137.207.14.63:8765');
+
+        socket.onopen = function(e) {
+            connectionStatus.textContent = "Connected to server";
+            connectionStatus.style.color = "#2e7d32";
+        };
+
+        socket.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            console.log(data)
+            
+            // Update dashboard with new data
+            speedElement.textContent = `${data.speed_kmph} km/h`;
+            rpmElement.textContent = data.rpm;
+            gearElement.textContent = data.gear;
+            inLaneElement.textContent = data.in_lane ? "Yes" : "No";
+            inLaneElement.style.color = data.in_lane ? "green" : "red";
+            engineTempElement.textContent = data.engine_temp;
+            fuelLevelElement.textContent = data.fuel_level;
+            
+            // Handle warnings
+            warningsElement.innerHTML = '';
+            if (data.warning && data.warning.length > 0) {
+                data.warning.forEach(warn => {
+                    const warningElement = document.createElement('div');
+                    warningElement.className = 'warning';
+                    warningElement.textContent = `⚠ ${warn}`;
+                    warningsElement.appendChild(warningElement);
+                });
+            }
+        };
+
+        socket.onclose = function(event) {
+            if (event.wasClean) {
+                connectionStatus.textContent = `Connection closed cleanly, code=${event.code} reason=${event.reason}`;
+            } else {
+                connectionStatus.textContent = 'Connection died';
+                connectionStatus.style.color = "#d32f2f";
+            }
+        };
+
+        socket.onerror = function(error) {
+            connectionStatus.textContent = `WebSocket error: ${error.message}`;
+            connectionStatus.style.color = "#d32f2f";
+        };
+    </script>
+</body>
+</html>
