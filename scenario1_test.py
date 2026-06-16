@@ -1,62 +1,63 @@
 """
-Scenario 1 - Step 4: A1-A4 Cut-in Events
-Fixes:
-- NPC moves forward AND laterally simultaneously during lane change (no stopping)
-- Speed properly ramped at each phase
-- NPC spawns 10s before event in lane 3, tails ego, then overtakes and cuts in
-- 4 different vehicle models
+Scenario 1 — Full Script
+========================
+Lane mapping (Road 36, negative direction):
+  Lane -1 = Lane 1 (leftmost / fast lane)
+  Lane -2 = Lane 2 (EGO lane for A1-A4)
+  Lane -3 = Lane 3 (rightmost / NPC lane for A1-A4, EGO lane for congestion)
+
+A1-A4  (0-500s):   NPCs spawn in lane -3, cut LEFT into lane -2 (ego lane)
+Congestion (500s+): Ego moves to lane -3. Queue in lane -3 ahead of ego.
+                    Cut-ins go from lane -2 RIGHT into lane -3 (ego's new lane)
 """
 
-from typing import Optional
-import carla, time, math
+import carla, time, math, random
+from enum import Enum
 
-CARLA_HOST          = "localhost"
-CARLA_PORT          = 2000
-FIXED_DELTA_SECONDS = 0.05
-TM_PORT             = 8001
+CARLA_HOST  = "localhost"
+CARLA_PORT  = 2000
+FDS         = 0.05
+TM_PORT     = 8001
+ROAD_LIMIT  = 120.0
 
-ROAD_SPEED_LIMIT    = 120.0
-SPEED_CRUISE        = 50.0
-SPEED_CATCHUP       = 110.0
-SPEED_SLOW          = 70.0
-CUT_AHEAD_M         = 10.0
-SPAWN_BEFORE_S      = 10.0
-DESTROY_M           = 300.0
+SPEED_CRUISE    = 100.0
+SPEED_CATCHUP   = 110.0
+SPEED_SLOW      = 70.0
+SPEED_CONG_MIN  = 5.0
+SPEED_CONG_MAX  = 10.0
+CUT_AHEAD_M     = 10.0
+SPAWN_BEFORE_S  = 10.0
+DESTROY_M       = 300.0
+NUM_CONG_VEHS   = 8
 
-SPEED_TARGET_LOW    = 100.0
-SPEED_TARGET_HIGH   = 105.0
-SPEED_WARN_LOW      = 90.0
-SLOW_WARN_DELAY_S   = 20.0
+SPEED_LOW  = 100.0; SPEED_HIGH = 105.0
+WARN_LOW   = 90.0;  WARN_DELAY = 20.0
 
-COLOR_OK     = carla.Color(r=0,   g=220, b=0)
-COLOR_WARN   = carla.Color(r=255, g=180, b=0)
-COLOR_DANGER = carla.Color(r=255, g=40,  b=40)
-COLOR_INFO   = carla.Color(r=100, g=200, b=255)
+COLOR_OK     = carla.Color(0, 220, 0)
+COLOR_WARN   = carla.Color(255, 180, 0)
+COLOR_DANGER = carla.Color(255, 40, 40)
+COLOR_INFO   = carla.Color(100, 200, 255)
+COLOR_RATING = carla.Color(255, 255, 0)
 
-NPC_MODELS = [
-    "vehicle.audi.a2",
-    "vehicle.bmw.grandtourer",
-    "vehicle.mercedes.coupe",
-    "vehicle.nissan.micra",
-]
+class DecelType(Enum):
+    RAPID   = 3.0
+    GRADUAL = 6.0
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Utilities ─────────────────────────────────────────────────────────────────
+def pct(kmh): return ((ROAD_LIMIT - kmh) / ROAD_LIMIT) * 100.0
 def is_alive(a):
     try:    return a is not None and a.is_alive
     except: return False
-
 def safe_destroy(a):
     try:
         if is_alive(a): a.set_autopilot(False); a.destroy()
     except: pass
-
 def kmh_of(a):
     if not is_alive(a): return 0.0
     try:
         v = a.get_velocity()
         return 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
     except: return 0.0
-
 def dist_ahead(ego, npc):
     if not is_alive(ego) or not is_alive(npc): return 0.0
     try:
@@ -64,6 +65,102 @@ def dist_ahead(ego, npc):
         d   = npc.get_transform().location - tf.location
         return d.x*fwd.x + d.y*fwd.y
     except: return 0.0
+
+
+def get_ego_wp(world, ego):
+    """Get ego's current waypoint."""
+    return world.get_map().get_waypoint(
+        ego.get_transform().location, project_to_road=True,
+        lane_type=carla.LaneType.Driving)
+
+
+def wp_in_lane(wp, target_lane_id):
+    """
+    Walk from wp to target_lane_id using get_left_lane / get_right_lane.
+    Returns waypoint in target lane or None.
+    In CARLA negative lanes: -1 is leftmost, -3 is rightmost.
+    get_left_lane()  from -2 → -1 (more left, lower abs value)
+    get_right_lane() from -2 → -3 (more right, higher abs value)
+    """
+    cur = wp
+    for _ in range(6):
+        if cur is None: return None
+        if cur.lane_id == target_lane_id: return cur
+        # Decide direction: negative lanes, higher abs = more right
+        if abs(target_lane_id) > abs(cur.lane_id):
+            nxt = cur.get_right_lane()   # going right (e.g. -2 → -3)
+        else:
+            nxt = cur.get_left_lane()    # going left  (e.g. -3 → -2)
+        if nxt and nxt.lane_type == carla.LaneType.Driving:
+            cur = nxt
+        else:
+            break
+    return cur if cur and cur.lane_id == target_lane_id else None
+
+
+def spawn_at_wp(world, wp, model=None):
+    """Spawn vehicle at waypoint. Returns actor or None."""
+    blib = world.get_blueprint_library()
+    bp   = None
+    if model:
+        found = blib.filter(model)
+        if found: bp = found[0]
+    if not bp:
+        cars = [b for b in blib.filter("vehicle.*")
+                if "dreyevr" not in b.id
+                and int(b.get_attribute("number_of_wheels")) == 4]
+        bp = random.choice(cars) if cars else blib.find("vehicle.tesla.model3")
+    bp.set_attribute("role_name", "npc")
+    tf = carla.Transform(
+        carla.Location(x=wp.transform.location.x,
+                       y=wp.transform.location.y,
+                       z=wp.transform.location.z + 0.3),
+        wp.transform.rotation)
+    return world.try_spawn_actor(bp, tf)
+
+
+def spawn_behind_in_lane(world, ego, lane_id, behind_m, model=None):
+    """
+    Spawn vehicle behind ego by behind_m metres in lane_id.
+    Returns actor or None.
+    """
+    ego_wp = get_ego_wp(world, ego)
+    if not ego_wp: return None
+    # Go to ego's lane first then walk to target lane
+    ego_lane_wp = wp_in_lane(ego_wp, lane_id)
+    if not ego_lane_wp: return None
+    prev = ego_lane_wp.previous(behind_m)
+    if not prev: return None
+    spawn_wp = prev[0]
+    # Ensure we are in target lane after going back
+    spawn_wp = wp_in_lane(spawn_wp, lane_id) or spawn_wp
+    npc = spawn_at_wp(world, spawn_wp, model)
+    if npc:
+        npc.set_autopilot(False)
+        npc.set_simulate_physics(True)
+        print(f"[Spawn] id={npc.id}  lane={spawn_wp.lane_id}  {behind_m:.0f}m behind")
+    return npc
+
+
+def spawn_ahead_in_lane(world, ego, lane_id, ahead_m, model=None):
+    """
+    Spawn vehicle ahead of ego by ahead_m metres in lane_id.
+    Returns actor or None.
+    """
+    ego_wp = get_ego_wp(world, ego)
+    if not ego_wp: return None
+    ego_lane_wp = wp_in_lane(ego_wp, lane_id)
+    if not ego_lane_wp: return None
+    nexts = ego_lane_wp.next(ahead_m)
+    if not nexts: return None
+    spawn_wp = nexts[0]
+    spawn_wp = wp_in_lane(spawn_wp, lane_id) or spawn_wp
+    npc = spawn_at_wp(world, spawn_wp, model)
+    if npc:
+        npc.set_autopilot(False)
+        npc.set_simulate_physics(True)
+        print(f"[Spawn] id={npc.id}  lane={spawn_wp.lane_id}  {ahead_m:.0f}m ahead")
+    return npc
 
 
 # ── Connect ───────────────────────────────────────────────────────────────────
@@ -80,179 +177,17 @@ def connect_and_load(host, port, map_name="Town04"):
 
 # ── Ego ───────────────────────────────────────────────────────────────────────
 def find_ego_vehicle(world):
-    ego_vehicles = list(world.get_actors().filter("harplab.dreyevr_vehicle.*"))
-    if ego_vehicles: return ego_vehicles[0]
-    model = "harplab.dreyevr_vehicle.model3"
-    print(f'No EgoVehicle found, spawning: "{model}"')
-    bp = world.get_blueprint_library().find(model)
+    v = list(world.get_actors().filter("harplab.dreyevr_vehicle.*"))
+    if v: return v[0]
+    bp = world.get_blueprint_library().find("harplab.dreyevr_vehicle.model3")
     return world.spawn_actor(bp, world.get_map().get_spawn_points()[0])
-
-def precise_respawn(vehicle, location, yaw=None, pitch=0.0, roll=0.0):
-    try:
-        if not isinstance(location, carla.Location):
-            location = carla.Location(*location)
-        if yaw is None:
-            wp  = vehicle.get_world().get_map().get_waypoint(location, project_to_road=True)
-            yaw = wp.transform.rotation.yaw if wp else 0.0
-        vehicle.set_simulate_physics(False)
-        vehicle.set_transform(carla.Transform(
-            location, carla.Rotation(pitch=float(pitch), yaw=float(yaw), roll=float(roll))))
-        time.sleep(0.1)
-        vehicle.set_simulate_physics(True)
-        return True
-    except Exception as e:
-        print(f"Respawn failed: {e}")
-        try: vehicle.set_simulate_physics(True)
-        except: pass
-        return False
-
-
-# ── NPC spawn ─────────────────────────────────────────────────────────────────
-def spawn_npc_lane3(world, ego, behind_m=8.0, model="vehicle.audi.a2"):
-    """Spawn NPC in lane 3, behind_m behind ego. Physics ON, no autopilot."""
-    town_map = world.get_map()
-    ego_wp   = town_map.get_waypoint(
-        ego.get_transform().location, project_to_road=True,
-        lane_type=carla.LaneType.Driving)
-    if not ego_wp: return None
-
-    prev = ego_wp.previous(behind_m)
-    if not prev: return None
-    wp = prev[0]
-
-    for _ in range(6):
-        if wp.lane_id == -3: break
-        r = wp.get_right_lane(); l = wp.get_left_lane()
-        if r and r.lane_type == carla.LaneType.Driving: wp = r
-        elif l and l.lane_type == carla.LaneType.Driving: wp = l
-        else: break
-
-    tf = carla.Transform(
-        carla.Location(x=wp.transform.location.x,
-                       y=wp.transform.location.y,
-                       z=wp.transform.location.z + 0.3),
-        wp.transform.rotation)
-
-    blib = world.get_blueprint_library()
-    bp   = None
-    for m in [model] + NPC_MODELS + ["vehicle.tesla.model3"]:
-        found = blib.filter(m)
-        if found: bp = found[0]; break
-    if not bp: return None
-    bp.set_attribute("role_name", "npc")
-
-    npc = world.try_spawn_actor(bp, tf)
-    if not npc: print(f"[NPC] Spawn failed"); return None
-
-    # Physics ON, no autopilot — we control via set_transform each tick
-    npc.set_autopilot(False)
-    print(f"[NPC] id={npc.id}  model={bp.id}  lane={wp.lane_id}  {behind_m:.0f}m behind")
-    return npc
-
-
-# ── Kinematic driver ──────────────────────────────────────────────────────────
-class KinematicDriver:
-    """
-    Drives NPC kinematically using waypoints + set_transform each tick.
-    Physics OFF so no crashes, but position/rotation follows road naturally.
-    Supports smooth lateral lane change while continuing forward motion.
-    """
-    def __init__(self, world, npc, lane_id=-3):
-        self.world   = world
-        self.npc     = npc
-        self.lane_id = lane_id
-        self._wp     = self._find_wp(npc.get_transform().location, lane_id)
-        self._lateral_offset = 0.0      # current lateral offset in metres
-        self._lateral_target = 0.0      # target lateral offset
-        self._lateral_speed  = 1.5      # metres per second lateral shift
-        npc.set_simulate_physics(False)
-
-    def _find_wp(self, loc, lane_id):
-        town_map = self.world.get_map()
-        wp = town_map.get_waypoint(loc, project_to_road=True,
-                                    lane_type=carla.LaneType.Driving)
-        if not wp: return None
-        for _ in range(6):
-            if wp.lane_id == lane_id: return wp
-            l = wp.get_left_lane(); r = wp.get_right_lane()
-            if l and l.lane_type == carla.LaneType.Driving: wp = l
-            elif r and r.lane_type == carla.LaneType.Driving: wp = r
-            else: break
-        return wp
-
-    def change_lane(self, target_lane_id):
-        """
-        Compute lateral offset needed to reach target lane centre.
-        NPC will drift laterally each tick while still moving forward.
-        """
-        if not self._wp: return
-        cur_wp = self._wp
-        tgt_wp = cur_wp
-        for _ in range(6):
-            if tgt_wp.lane_id == target_lane_id: break
-            l = tgt_wp.get_left_lane(); r = tgt_wp.get_right_lane()
-            if l and l.lane_type == carla.LaneType.Driving: tgt_wp = l
-            elif r and r.lane_type == carla.LaneType.Driving: tgt_wp = r
-            else: break
-
-        # Compute lateral distance between lane centres
-        cur_loc = cur_wp.transform.location
-        tgt_loc = tgt_wp.transform.location
-        # Right vector of road
-        right = cur_wp.transform.get_right_vector()
-        dx = tgt_loc.x - cur_loc.x
-        dy = tgt_loc.y - cur_loc.y
-        # Project onto right vector to get signed lateral distance
-        lat = dx * right.x + dy * right.y
-        self._lateral_target = lat
-        self.lane_id = target_lane_id
-        print(f"[KD] id={self.npc.id} lane change → {target_lane_id}  "
-              f"lateral_dist={lat:.2f}m")
-
-    def in_target_lane(self):
-        """Returns True when lateral offset has reached target."""
-        return abs(self._lateral_offset - self._lateral_target) < 0.1
-
-    def tick(self, speed_kmh):
-        """Advance NPC forward at speed_kmh, drift laterally if lane changing."""
-        if not is_alive(self.npc) or not self._wp:
-            return
-
-        dt   = FIXED_DELTA_SECONDS
-        dist = (speed_kmh / 3.6) * dt
-
-        # Advance waypoint forward
-        nexts = self._wp.next(dist)
-        if nexts:
-            self._wp = nexts[0]
-
-        # Update lateral offset toward target
-        lat_diff = self._lateral_target - self._lateral_offset
-        lat_step = self._lateral_speed * dt
-        if abs(lat_diff) < lat_step:
-            self._lateral_offset = self._lateral_target
-        else:
-            self._lateral_offset += math.copysign(lat_step, lat_diff)
-
-        # Build final transform: road waypoint + lateral offset
-        wp_tf    = self._wp.transform
-        right    = wp_tf.get_right_vector()
-        offset_x = right.x * self._lateral_offset
-        offset_y = right.y * self._lateral_offset
-
-        final_loc = carla.Location(
-            x=wp_tf.location.x + offset_x,
-            y=wp_tf.location.y + offset_y,
-            z=wp_tf.location.z + 0.05)
-
-        self.npc.set_transform(carla.Transform(final_loc, wp_tf.rotation))
 
 
 # ── Indicator ─────────────────────────────────────────────────────────────────
-def flash_indicator(world, npc, duration_s=2.5):
+def show_indicator(world, npc, duration_s=2.5):
     if not is_alive(npc): return
     try:
-        tf = npc.get_transform(); fwd = tf.get_forward_vector()
+        tf  = npc.get_transform(); fwd = tf.get_forward_vector()
         left = carla.Location(x=tf.location.x + fwd.y*3.5,
                                y=tf.location.y - fwd.x*3.5,
                                z=tf.location.z + 1.5)
@@ -264,30 +199,349 @@ def flash_indicator(world, npc, duration_s=2.5):
     except: pass
 
 
-# ── HUD ───────────────────────────────────────────────────────────────────────
+# ── NPC Controller ────────────────────────────────────────────────────────────
+class NPCController:
+    """Physics-ON, apply_control each tick. Steers toward target_lane waypoint."""
+    LOOKAHEAD = 8.0; KP_STEER = 1.2; MAX_STEER = 0.6
+
+    def __init__(self, world, npc, target_lane):
+        self.world=world; self.npc=npc; self.target_lane=target_lane
+
+    def change_lane(self, lane_id):
+        print(f"[NPC {self.npc.id}] Lane target → {lane_id}")
+        self.target_lane = lane_id
+
+    def in_target_lane(self):
+        if not is_alive(self.npc): return False
+        try:
+            wp = self.world.get_map().get_waypoint(
+                self.npc.get_transform().location, project_to_road=True,
+                lane_type=carla.LaneType.Driving)
+            return wp is not None and wp.lane_id == self.target_lane
+        except: return False
+
+    def tick(self, target_kmh):
+        if not is_alive(self.npc): return
+        try:
+            npc_tf = self.npc.get_transform()
+            loc    = npc_tf.location
+            fwd    = npc_tf.get_forward_vector()
+            look   = carla.Location(x=loc.x+fwd.x*self.LOOKAHEAD,
+                                    y=loc.y+fwd.y*self.LOOKAHEAD, z=loc.z)
+            town_map = self.world.get_map()
+            wp = town_map.get_waypoint(look, project_to_road=True,
+                                        lane_type=carla.LaneType.Driving)
+            if not wp:
+                wp = town_map.get_waypoint(loc, project_to_road=True,
+                                            lane_type=carla.LaneType.Driving)
+            if not wp: return
+            tgt = wp_in_lane(wp, self.target_lane) or wp
+            to  = carla.Vector3D(tgt.transform.location.x-loc.x,
+                                  tgt.transform.location.y-loc.y, 0.0)
+            mag = math.sqrt(to.x**2+to.y**2)
+            if mag>0.001: to.x/=mag; to.y/=mag
+            cross = fwd.x*to.y - fwd.y*to.x
+            steer = max(-self.MAX_STEER, min(self.MAX_STEER, self.KP_STEER*cross))
+            spd   = kmh_of(self.npc); err = target_kmh-spd
+            if err>0: th=min(1.0,err/20.0); br=0.0
+            else:     th=0.0; br=min(1.0,abs(err)/10.0)
+            self.npc.apply_control(carla.VehicleControl(
+                throttle=float(th), steer=float(steer),
+                brake=float(br), hand_brake=False))
+        except Exception as e:
+            print(f"[NPCCtrl] {e}")
+
+
+# ── A-Event (A1-A4): lane -3 → lane -2 ───────────────────────────────────────
+class AEvent:
+    """
+    NPC spawns in lane -3 (right of ego), 8m behind.
+    Tails ego → overtakes → cuts LEFT into lane -2 (ego lane) → decelerates.
+    """
+    def __init__(self, label, indicator, decel_type, start_t, model):
+        self.label     = label
+        self.indicator = indicator
+        self.decel_type= decel_type
+        self.start_t   = start_t
+        self.model     = model
+        self.npc       = None
+        self.ctrl      = None
+        self.state     = "waiting"
+        self._state_t  = 0.0
+        self._ind_done = False
+        self._spawn_t  = start_t - SPAWN_BEFORE_S
+        print(f"[{label}] lane-3→lane-2  ind={'ON' if indicator else 'OFF'}  "
+              f"decel={decel_type.name}  spawn@{self._spawn_t:.0f}s")
+
+    def _set_state(self, s, t):
+        print(f"[{self.label}] {self.state} -> {s}  T={t:.1f}s")
+        self.state=s; self._state_t=t
+
+    def update(self, world, ego, t):
+        try: return self._update(world, ego, t)
+        except Exception as e:
+            print(f"[{self.label}] err: {e}"); return ""
+
+    def _update(self, world, ego, t):
+        ego_spd = kmh_of(ego) if is_alive(ego) else SPEED_CRUISE
+
+        if self.state == "waiting":
+            if t >= self._spawn_t:
+                # Spawn in lane -3 (right of ego), 8m behind
+                npc = spawn_behind_in_lane(world, ego, lane_id=-3,
+                                           behind_m=8.0, model=self.model)
+                if npc:
+                    self.npc  = npc
+                    self.ctrl = NPCController(world, npc, target_lane=-3)
+                    self._set_state("tailing", t)
+                else:
+                    print(f"[{self.label}] spawn failed — retry next tick")
+            return ""
+
+        if not is_alive(self.npc): return f"{self.label} (gone)"
+        ahead = dist_ahead(ego, self.npc)
+
+        if self.state == "tailing":
+            self.ctrl.tick(max(ego_spd, 20.0))
+            if t >= self.start_t: self._set_state("overtake", t)
+            return f"{self.label} — tailing lane-3  {kmh_of(self.npc):.0f} km/h"
+
+        elif self.state == "overtake":
+            ramp = min((t-self._state_t)/5.0, 1.0)
+            spd  = ego_spd + ramp*(SPEED_CATCHUP-ego_spd)
+            self.ctrl.tick(spd)
+            if ahead >= CUT_AHEAD_M:
+                if not self._ind_done:
+                    if self.indicator: show_indicator(world, self.npc, 2.5)
+                    self._ind_done = True
+                # Cut LEFT: lane -3 → lane -2
+                self.ctrl.change_lane(-2)
+                self._set_state("cutin", t)
+            return (f"{self.label} — overtaking  "
+                    f"{kmh_of(self.npc):.0f} km/h  ahead={ahead:.0f}m")
+
+        elif self.state == "cutin":
+            self.ctrl.tick(SPEED_CRUISE)
+            if self.ctrl.in_target_lane(): self._set_state("decel", t)
+            return f"{self.label} — cutting in lane-3→lane-2"
+
+        elif self.state == "decel":
+            progress = min((t-self._state_t)/self.decel_type.value, 1.0)
+            spd = SPEED_CRUISE + progress*(SPEED_SLOW-SPEED_CRUISE)
+            self.ctrl.tick(spd)
+            if progress >= 1.0: self._set_state("tail_ego", t)
+            return (f"{self.label} — decel ({self.decel_type.name})  "
+                    f"{kmh_of(self.npc):.0f} km/h")
+
+        elif self.state == "tail_ego":
+            self.ctrl.tick(SPEED_SLOW)
+            if t-self._state_t >= 5.0: self._set_state("reaccel", t)
+            return f"{self.label} — tail  {kmh_of(self.npc):.0f} km/h"
+
+        elif self.state == "reaccel":
+            progress = min((t-self._state_t)/20.0, 1.0)
+            spd = SPEED_SLOW + progress*(SPEED_CRUISE-SPEED_SLOW)
+            self.ctrl.tick(spd)
+            if progress >= 1.0: self._set_state("done", t)
+            return f"{self.label} — reaccel  {kmh_of(self.npc):.0f} km/h"
+
+        elif self.state == "done":
+            self.ctrl.tick(SPEED_CRUISE)
+            if ahead > DESTROY_M or ahead < -50.0:
+                safe_destroy(self.npc); self.npc=None
+                return f"{self.label} — done"
+            return f"{self.label} — cruising"
+
+        return ""
+
+
+# ── Congestion cut-in: lane -2 → lane -3 (ego's congestion lane) ─────────────
+class CongestionCutIn:
+    """
+    Ego is in lane -3 (congestion queue).
+    NPC spawns in lane -2 (flowing), overtakes ego,
+    then cuts RIGHT into lane -3 (ego's lane) and brakes.
+    solid_line=True = no indicator.
+    """
+    def __init__(self, label, trigger_t, solid_line=False):
+        self.label      = label
+        self.trigger_t  = trigger_t
+        self.solid_line = solid_line
+        self.npc        = None
+        self.ctrl       = None
+        self.state      = "waiting"
+        self._state_t   = 0.0
+        self._ind_done  = False
+        print(f"[{label}] lane-2→lane-3  @ {trigger_t}s  "
+              f"solid={'YES' if solid_line else 'no'}")
+
+    def _set_state(self, s, t):
+        print(f"[{self.label}] {self.state} -> {s}  T={t:.1f}s")
+        self.state=s; self._state_t=t
+
+    def update(self, world, ego, t):
+        try: return self._update(world, ego, t)
+        except Exception as e:
+            print(f"[{self.label}] err: {e}"); return ""
+
+    def _update(self, world, ego, t):
+        if self.state == "waiting":
+            if t >= self.trigger_t:
+                # Spawn in lane -2 (flowing), 15m behind ego
+                npc = spawn_behind_in_lane(world, ego, lane_id=-2,
+                                           behind_m=15.0, model="vehicle.audi.a2")
+                if npc:
+                    self.npc  = npc
+                    self.ctrl = NPCController(world, npc, target_lane=-2)
+                    self._set_state("overtake", t)
+            return ""
+
+        if not is_alive(self.npc): return f"{self.label} (gone)"
+        ahead = dist_ahead(ego, self.npc)
+
+        if self.state == "overtake":
+            # NPC in lane -2, drive at cruise speed (flowing traffic)
+            ramp = min((t-self._state_t)/5.0, 1.0)
+            spd  = SPEED_CONG_MAX + ramp*(SPEED_CRUISE-SPEED_CONG_MAX)
+            self.ctrl.tick(spd)
+            if ahead >= CUT_AHEAD_M:
+                if not self._ind_done:
+                    # Dashed = indicator ON (right blinker for lane -2→-3)
+                    if not self.solid_line:
+                        show_indicator(world, self.npc, 2.5)
+                        print(f"[{self.label}] Indicator ON (dashed line)")
+                    else:
+                        print(f"[{self.label}] No indicator (solid line violation)")
+                    self._ind_done = True
+                # Cut RIGHT: lane -2 → lane -3
+                self.ctrl.change_lane(-3)
+                self._set_state("cutin", t)
+            return f"{self.label} — lane-2 flowing  ahead={ahead:.0f}m"
+
+        elif self.state == "cutin":
+            self.ctrl.tick(SPEED_CRUISE)
+            if self.ctrl.in_target_lane(): self._set_state("decel", t)
+            return f"{self.label} — cutting in lane-2→lane-3"
+
+        elif self.state == "decel":
+            progress = min((t-self._state_t)/3.0, 1.0)
+            spd = SPEED_CRUISE + progress*(SPEED_SLOW-SPEED_CRUISE)
+            self.ctrl.tick(spd)
+            if progress >= 1.0: self._set_state("cruise", t)
+            return f"{self.label} — decel  {kmh_of(self.npc):.0f} km/h"
+
+        elif self.state == "cruise":
+            self.ctrl.tick(SPEED_SLOW)
+            if ahead > DESTROY_M or ahead < -50.0:
+                safe_destroy(self.npc); self.npc=None
+                return f"{self.label} — done"
+            return f"{self.label} — cruising  {kmh_of(self.npc):.0f} km/h"
+
+        return ""
+
+
+# ── Exit cut-in (810-890s) ────────────────────────────────────────────────────
+class ExitCutIn:
+    """Sudden cut-in without indicator + hard brake near exit (810-890s)."""
+    def __init__(self):
+        self.npc=None; self.ctrl=None
+        self.state="waiting"; self._state_t=0.0
+        print("[Exit] Ready @ 810s")
+
+    def _set_state(self, s, t):
+        print(f"[Exit] {self.state} -> {s}  T={t:.1f}s")
+        self.state=s; self._state_t=t
+
+    def update(self, world, ego, t):
+        try: return self._update(world, ego, t)
+        except Exception as e:
+            print(f"[Exit] err: {e}"); return ""
+
+    def _update(self, world, ego, t):
+        ego_spd = kmh_of(ego) if is_alive(ego) else SPEED_CRUISE
+
+        if self.state == "waiting":
+            if t >= 810.0:
+                # Spawn in lane -3 (ego's exit lane), 8m behind
+                npc = spawn_behind_in_lane(world, ego, lane_id=-3,
+                                           behind_m=8.0,
+                                           model="vehicle.mercedes.coupe")
+                if npc:
+                    self.npc  = npc
+                    self.ctrl = NPCController(world, npc, -3)
+                    self._set_state("overtake", t)
+            return ""
+
+        if not is_alive(self.npc): return "Exit gone"
+        ahead = dist_ahead(ego, self.npc)
+
+        if self.state == "overtake":
+            ramp = min((t-self._state_t)/4.0, 1.0)
+            spd  = ego_spd + ramp*(SPEED_CATCHUP-ego_spd)
+            self.ctrl.tick(spd)
+            if ahead >= CUT_AHEAD_M:
+                print("[Exit] Sudden cut-in — NO indicator!")
+                # Cut LEFT into ego's lane (-3 → -2 near exit)
+                self.ctrl.change_lane(-2)
+                self._set_state("cutin", t)
+            return f"Exit — overtaking  ahead={ahead:.0f}m"
+
+        elif self.state == "cutin":
+            self.ctrl.tick(SPEED_CRUISE)
+            if self.ctrl.in_target_lane(): self._set_state("hard_brake", t)
+            return "Exit — cutting in"
+
+        elif self.state == "hard_brake":
+            elapsed = t - self._state_t
+            if elapsed < 4.0:
+                self.npc.apply_control(carla.VehicleControl(
+                    throttle=0.0, brake=0.9, hand_brake=False))
+                return f"Exit — HARD BRAKE  {kmh_of(self.npc):.0f} km/h"
+            self._set_state("cruise", t)
+            return "Exit — braking"
+
+        elif self.state == "cruise":
+            self.ctrl.tick(40.0)
+            if ahead > DESTROY_M or ahead < -50.0:
+                safe_destroy(self.npc); self.npc=None
+                return "Exit — done"
+            return f"Exit — slow cruise  {kmh_of(self.npc):.0f} km/h"
+
+        return ""
+
+
+# ── Rating prompt ─────────────────────────────────────────────────────────────
+def show_rating(world, ego, msg, duration_s=15.0):
+    if not is_alive(ego): return
+    try:
+        loc = ego.get_transform().location
+        world.debug.draw_string(loc+carla.Location(z=8.0), msg,
+            draw_shadow=True, color=COLOR_RATING,
+            life_time=duration_s, persistent_lines=False)
+        print(f"\n[RATING] {msg}\n")
+    except: pass
+
+
+# ── HUD & Speed Monitor ───────────────────────────────────────────────────────
 class HUD:
-    def __init__(self, world, ego):
-        self.world = world; self.ego = ego
+    def __init__(self, world, ego): self.world=world; self.ego=ego
     def update(self, spd, warning, t, label=""):
         if not is_alive(self.ego): return
-        try: loc = self.ego.get_transform().location
+        try: loc=self.ego.get_transform().location
         except: return
-        col = (COLOR_OK if SPEED_TARGET_LOW <= spd <= SPEED_TARGET_HIGH else
-               COLOR_DANGER if spd < SPEED_WARN_LOW or spd > SPEED_TARGET_HIGH
-               else COLOR_WARN)
-        lt = FIXED_DELTA_SECONDS * 2
-        self.world.debug.draw_string(loc + carla.Location(z=5.0),
+        col=(COLOR_OK if SPEED_LOW<=spd<=SPEED_HIGH else
+             COLOR_DANGER if spd<WARN_LOW or spd>SPEED_HIGH else COLOR_WARN)
+        lt=FDS*2
+        self.world.debug.draw_string(loc+carla.Location(z=5.0),
             f"Speed: {spd:.1f} km/h   T+{t:.0f}s",
-            draw_shadow=True, color=col, life_time=lt, persistent_lines=False)
+            draw_shadow=True,color=col,life_time=lt,persistent_lines=False)
         if label:
-            self.world.debug.draw_string(loc + carla.Location(z=6.5), label,
-                draw_shadow=True, color=COLOR_INFO, life_time=lt, persistent_lines=False)
+            self.world.debug.draw_string(loc+carla.Location(z=6.5),label,
+                draw_shadow=True,color=COLOR_INFO,life_time=lt,persistent_lines=False)
         if warning:
-            self.world.debug.draw_string(loc + carla.Location(z=3.8), warning,
-                draw_shadow=True, color=COLOR_DANGER, life_time=lt, persistent_lines=False)
+            self.world.debug.draw_string(loc+carla.Location(z=3.8),warning,
+                draw_shadow=True,color=COLOR_DANGER,life_time=lt,persistent_lines=False)
 
-
-# ── Speed monitor ─────────────────────────────────────────────────────────────
 class SpeedMonitor:
     def __init__(self, world, ego):
         self.world=world; self.ego=ego; self.hud=HUD(world,ego)
@@ -299,211 +553,196 @@ class SpeedMonitor:
             return 3.6*math.sqrt(v.x**2+v.y**2+v.z**2)
         except: return 0.0
     def _warn(self, spd):
-        if spd > SPEED_TARGET_HIGH:
+        if spd>SPEED_HIGH:
             self.slow_since=None
-            return f"! Too fast ({spd:.0f}) target {SPEED_TARGET_LOW:.0f}-{SPEED_TARGET_HIGH:.0f}"
-        if spd < SPEED_WARN_LOW:
+            return "Please drive at 100-105 km/h. Your current speed is too fast."
+        if spd<WARN_LOW:
             if self.slow_since is None: self.slow_since=self.scenario_time
-            elif self.scenario_time-self.slow_since >= SLOW_WARN_DELAY_S:
-                return f"! Too slow ({spd:.0f}) reach {SPEED_TARGET_LOW:.0f}-{SPEED_TARGET_HIGH:.0f}"
+            elif self.scenario_time-self.slow_since>=WARN_DELAY:
+                return ("Please drive at 100-105 km/h. "
+                        "Your current speed is too low. "
+                        "Please accelerate to the target speed.")
         else: self.slow_since=None
-        if SPEED_TARGET_LOW <= spd <= SPEED_TARGET_HIGH: return ""
+        if SPEED_LOW<=spd<=SPEED_HIGH: return ""
         return self.warning
     def tick(self, dt, label=""):
-        self.scenario_time += dt
+        self.scenario_time+=dt
         spd=self.ego_kmh(); self.warning=self._warn(spd)
-        self.hud.update(spd, self.warning, self.scenario_time, label)
+        self.hud.update(spd,self.warning,self.scenario_time,label)
         return self.scenario_time, spd
 
 
-# ── A-Event ───────────────────────────────────────────────────────────────────
-class AEvent:
-    """
-    States:
-      waiting   : before spawn time (start_t - SPAWN_BEFORE_S)
-      tailing   : NPC in lane 3, matching ego speed (10s)
-      overtake  : NPC accelerates to CUT_AHEAD_M ahead
-      cutin     : lane change triggered, drifting to lane 2
-      decel     : 100->70 over decel_time_s
-      tail_ego  : hold 70 km/h
-      reaccel   : 70->100 over 20s
-      done      : cruise 100 km/h
-    """
-    def __init__(self, label, indicator, decel_time_s, start_t,
-                 vehicle_model="vehicle.audi.a2"):
-        self.label         = label
-        self.indicator     = indicator
-        self.decel_time_s  = decel_time_s
-        self.start_t       = start_t
-        self.vehicle_model = vehicle_model
-        self.npc           = None
-        self.driver        = None
-        self.state         = "waiting"
-        self._state_t      = 0.0
-        self._ind_done     = False
-        self._spawn_t      = start_t - SPAWN_BEFORE_S
-        print(f"[{label}] model={vehicle_model}  "
-              f"indicator={'ON' if indicator else 'OFF'}  "
-              f"decel={decel_time_s}s  spawn@{self._spawn_t:.0f}s  cutin@{start_t:.0f}s")
-
-    def _set_state(self, s, t):
-        print(f"[{self.label}] {self.state} -> {s}  T={t:.1f}s")
-        self.state=s; self._state_t=t
-
-    def update(self, world, ego, t):
-        try: return self._update(world, ego, t)
-        except Exception as e:
-            print(f"[{self.label}] error: {e}"); return ""
-
-    def _update(self, world, ego, t):
-        ego_spd = kmh_of(ego) if is_alive(ego) else SPEED_CRUISE
-
-        # ── Waiting: spawn NPC 10s before event ──────────────────────
-        if self.state == "waiting":
-            if t >= self._spawn_t:
-                self.npc = spawn_npc_lane3(
-                    world, ego,
-                    behind_m=8.0,
-                    model=self.vehicle_model)
-                if self.npc:
-                    self.driver = KinematicDriver(world, self.npc, lane_id=-3)
-                    self._set_state("tailing", t)
-                else:
-                    print(f"[{self.label}] spawn failed")
-            return ""
-
-        if not is_alive(self.npc):
-            return f"{self.label} (NPC gone)"
-
-        ahead = dist_ahead(ego, self.npc)
-
-        # ── Tailing: match ego speed in lane 3 ───────────────────────
-        if self.state == "tailing":
-            spd = max(ego_spd, 20.0)
-            self.driver.tick(spd)
-            if t >= self.start_t:
-                self._set_state("overtake", t)
-            return f"{self.label} — tailing  {spd:.0f} km/h"
-
-        # ── Overtake: accelerate to get CUT_AHEAD_M ahead ────────────
-        elif self.state == "overtake":
-            # Ramp from ego speed to CATCHUP over 5s
-            ramp = min((t - self._state_t) / 5.0, 1.0)
-            spd  = ego_spd + ramp * (SPEED_CATCHUP - ego_spd)
-            self.driver.tick(spd)
-            if ahead >= CUT_AHEAD_M:
-                if not self._ind_done and self.indicator:
-                    flash_indicator(world, self.npc, duration_s=2.5)
-                    print(f"[{self.label}] Indicator ON")
-                self._ind_done = True
-                self.driver.change_lane(-2)
-                self._set_state("cutin", t)
-            return f"{self.label} — overtaking  {spd:.0f} km/h  ahead={ahead:.0f}m"
-
-        # ── Cutin: continue forward at cruise while drifting to lane 2
-        elif self.state == "cutin":
-            self.driver.tick(SPEED_CRUISE)
-            if self.driver.in_target_lane():
-                self._set_state("decel", t)
-            return f"{self.label} — cutting in..."
-
-        # ── Decel: 100->70 over decel_time_s ─────────────────────────
-        elif self.state == "decel":
-            progress = min((t - self._state_t) / self.decel_time_s, 1.0)
-            spd = SPEED_CRUISE + progress * (SPEED_SLOW - SPEED_CRUISE)
-            self.driver.tick(spd)
-            if progress >= 1.0: self._set_state("tail_ego", t)
-            style = "rapid" if self.decel_time_s == 3 else "gradual"
-            return f"{self.label} — decel ({style})  {spd:.0f} km/h"
-
-        # ── Tail ego: hold 70 km/h ────────────────────────────────────
-        elif self.state == "tail_ego":
-            self.driver.tick(SPEED_SLOW)
-            if t - self._state_t >= 5.0: self._set_state("reaccel", t)
-            return f"{self.label} — tail  {SPEED_SLOW:.0f} km/h"
-
-        # ── Reaccel: 70->100 over 20s ────────────────────────────────
-        elif self.state == "reaccel":
-            progress = min((t - self._state_t) / 20.0, 1.0)
-            spd = SPEED_SLOW + progress * (SPEED_CRUISE - SPEED_SLOW)
-            self.driver.tick(spd)
-            if progress >= 1.0: self._set_state("done", t)
-            return f"{self.label} — reaccel  {spd:.0f} km/h"
-
-        # ── Done: cruise at 100 ───────────────────────────────────────
-        elif self.state == "done":
-            self.driver.tick(SPEED_CRUISE)
-            if ahead > DESTROY_M or ahead < -50.0:
-                print(f"[{self.label}] NPC removed")
-                safe_destroy(self.npc); self.npc=None
-                return f"{self.label} — done"
-            return f"{self.label} — cruising"
-
-        return ""
-
-
-# ── Beep ──────────────────────────────────────────────────────────────────────
-def beep(world, location):
-    world.debug.draw_point(location + carla.Location(z=2.5),
-                           size=0.8, color=carla.Color(255, 255, 255),
-                           life_time=0.5)
+def beep(world, loc):
+    world.debug.draw_point(loc+carla.Location(z=2.5),
+        size=0.8,color=carla.Color(255,255,255),life_time=0.5)
     print("[BEEP] *** t=0 ***")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     client, world = connect_and_load(CARLA_HOST, CARLA_PORT)
-    all_npcs      = []
+    all_npcs        = []
+    congestion_npcs = []
+
+    tm = client.get_trafficmanager(TM_PORT)
+    tm.set_synchronous_mode(False)
+    tm.set_random_device_seed(42)
+    tm.set_global_distance_to_leading_vehicle(3.0)
 
     try:
         ego = find_ego_vehicle(world)
         world.tick()
         beep(world, ego.get_transform().location)
 
-        events = [
-            AEvent("A1", True,  3.0, 60.0,  "vehicle.audi.a2"),
-            AEvent("A2", True,  6.0, 170.0, "vehicle.bmw.grandtourer"),
-            AEvent("A3", False, 3.0, 280.0, "vehicle.mercedes.coupe"),
-            AEvent("A4", False, 6.0, 390.0, "vehicle.nissan.micra"),
+        # A1-A4: NPCs in lane -3, cut left into lane -2
+        a_events = [
+            AEvent("A1", True,  DecelType.RAPID,    60.0, "vehicle.audi.a2"),
+            AEvent("A2", True,  DecelType.GRADUAL, 170.0, "vehicle.bmw.grandtourer"),
+            AEvent("A3", False, DecelType.RAPID,   280.0, "vehicle.mercedes.coupe"),
+            AEvent("A4", False, DecelType.GRADUAL, 390.0, "vehicle.nissan.micra"),
         ]
 
+        # Congestion cut-ins: NPCs in lane -2, cut right into lane -3
+        c_events = [
+            CongestionCutIn("C1", 530.0, solid_line=False),
+            CongestionCutIn("C2", 595.0, solid_line=False),
+            CongestionCutIn("C3", 665.0, solid_line=False),
+            CongestionCutIn("C4", 755.0, solid_line=True),
+        ]
+
+        exit_event = ExitCutIn()
+
+        rating_schedule = {
+            120.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            210.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            300.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            385.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            505.0: "How much anger or frustration do you feel\ndue to the current traffic congestion?",
+            570.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            635.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            705.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            795.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+        }
+        prompted          = set()
+        congestion_spawned= False
+        recovery_started  = False
+
         monitor      = SpeedMonitor(world, ego)
-        status_every = int(2.0 / FIXED_DELTA_SECONDS)
+        status_every = int(2.0 / FDS)
         tick_count   = 0
-        print("\n[Step 4] Running. Ctrl+C to stop.\n")
+
+        print("\n[Scenario 1] Running. Ctrl+C to stop.\n")
 
         while True:
             world.tick()
             if not is_alive(ego):
-                print("[Step 4] Ego lost."); break
+                print("Ego lost."); break
 
-            t, ego_spd = monitor.tick(FIXED_DELTA_SECONDS)
+            t, ego_spd = monitor.tick(FDS)
             label = "Adaptation — drive 100-105 km/h" if t < 60.0 else ""
 
-            for ev in events:
-                ev_label = ev.update(world, ego, t)
-                if ev_label: label = ev_label
-                if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
-                    all_npcs.append(ev.npc)
+            # ── A1-A4 (0-500s): ego in lane -2 ───────────────────────
+            if t < 500.0:
+                for ev in a_events:
+                    lbl = ev.update(world, ego, t)
+                    if lbl: label = lbl
+                    if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
+                        all_npcs.append(ev.npc)
+
+            # ── Spawn congestion queue at t=500 AHEAD in lane -3 ──────
+            if not congestion_spawned and t >= 500.0:
+                print("\n[Congestion] Spawning queue in lane -3 AHEAD of ego...")
+                beep(world, ego.get_transform().location)
+                ego_wp = get_ego_wp(world, ego)
+                if ego_wp:
+                    lane3_wp = wp_in_lane(ego_wp, -3)
+                    if lane3_wp:
+                        for i in range(NUM_CONG_VEHS):
+                            ahead_m = 15.0 + i * 10.0
+                            nexts   = lane3_wp.next(ahead_m)
+                            if not nexts: continue
+                            wp = nexts[0]
+                            npc = spawn_at_wp(world, wp)
+                            if npc:
+                                npc.set_autopilot(True, TM_PORT)
+                                tm.auto_lane_change(npc, False)
+                                tm.ignore_lights_percentage(npc, 100)
+                                tm.vehicle_percentage_speed_difference(
+                                    npc, pct(random.uniform(
+                                        SPEED_CONG_MIN, SPEED_CONG_MAX)))
+                                congestion_npcs.append(npc)
+                                all_npcs.append(npc)
+                print(f"[Congestion] {len(congestion_npcs)} vehicles in lane -3")
+                congestion_spawned = True
+
+            # ── 500-750s: congestion ──────────────────────────────────
+            if 500.0 <= t < 750.0:
+                label = (f"Congestion — ego in lane-3  "
+                         f"{SPEED_CONG_MIN:.0f}-{SPEED_CONG_MAX:.0f} km/h")
+                # Maintain slow speed in lane -3
+                for npc in congestion_npcs:
+                    if is_alive(npc):
+                        tm.vehicle_percentage_speed_difference(
+                            npc, pct(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX)))
+                # Cut-ins from lane -2 into lane -3
+                for ev in c_events:
+                    lbl = ev.update(world, ego, t)
+                    if lbl: label = lbl
+                    if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
+                        all_npcs.append(ev.npc)
+
+            # ── 750-800s: recovery ────────────────────────────────────
+            elif 750.0 <= t < 800.0:
+                if not recovery_started:
+                    print("[Congestion] Recovery starting...")
+                    recovery_started = True
+                progress     = (t-750.0)/50.0
+                recovery_spd = SPEED_CONG_MAX + progress*(SPEED_CRUISE-SPEED_CONG_MAX)
+                label        = f"Recovery — lane-3 → {recovery_spd:.0f} km/h"
+                for npc in congestion_npcs:
+                    if is_alive(npc):
+                        tm.vehicle_percentage_speed_difference(npc, pct(recovery_spd))
+
+            # ── 800-810s: pre-exit ────────────────────────────────────
+            elif 800.0 <= t < 810.0:
+                label = "Pre-exit transition"
+
+            # ── 810-890s: exit cut-in ─────────────────────────────────
+            elif 810.0 <= t < 890.0:
+                lbl = exit_event.update(world, ego, t)
+                if lbl: label = lbl
+                if (exit_event.npc and exit_event.npc not in all_npcs
+                        and is_alive(exit_event.npc)):
+                    all_npcs.append(exit_event.npc)
+
+            elif t >= 890.0:
+                label = "Cooldown"
+
+            # ── Rating prompts ────────────────────────────────────────
+            for pt, msg in rating_schedule.items():
+                if t >= pt and pt not in prompted:
+                    show_rating(world, ego, msg, duration_s=15.0)
+                    prompted.add(pt)
 
             monitor.hud.update(ego_spd, monitor.warning, t, label)
             tick_count += 1
             if tick_count % status_every == 0:
                 print(f"  T={t:>6.1f}s  ego={ego_spd:>5.1f} km/h  [{label}]")
 
-            if t >= 500.0:
-                print("\n[Step 4] Complete."); break
+            if t >= 900.0:
+                print("\n[Scenario 1] Complete at T=900s."); break
+
             time.sleep(0.001)
 
     except KeyboardInterrupt:
-        print("\n[Step 4] Stopped.")
+        print("\n[Scenario 1] Stopped.")
     finally:
         for npc in all_npcs: safe_destroy(npc)
         try:
             s=world.get_settings(); s.synchronous_mode=False
             s.fixed_delta_seconds=None; world.apply_settings(s)
         except: pass
-        print("[Step 4] Done.")
+        print("[Scenario 1] Done.")
 
 if __name__ == "__main__":
     main()
