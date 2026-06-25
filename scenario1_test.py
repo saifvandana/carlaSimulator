@@ -23,12 +23,12 @@ ROAD_LIMIT  = 120.0
 SPEED_CRUISE    = 100.0
 SPEED_CATCHUP   = 110.0
 SPEED_SLOW      = 70.0
-SPEED_CONG_MIN  = 5.0
-SPEED_CONG_MAX  = 10.0
-CUT_AHEAD_M     = 10.0
+SPEED_CONG_MIN  = 10.0
+SPEED_CONG_MAX  = 15.0
+CUT_AHEAD_M     = 5.0
 SPAWN_BEFORE_S  = 10.0
 DESTROY_M       = 300.0
-NUM_CONG_VEHS   = 8
+NUM_CONG_VEHS   = 5
 
 SPEED_LOW  = 100.0; SPEED_HIGH = 105.0
 WARN_LOW   = 90.0;  WARN_DELAY = 20.0
@@ -41,7 +41,7 @@ COLOR_RATING = carla.Color(255, 255, 0)
 
 class DecelType(Enum):
     RAPID   = 3.0
-    GRADUAL = 6.0
+    GRADUAL = 5.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def pct(kmh): return ((ROAD_LIMIT - kmh) / ROAD_LIMIT) * 100.0
@@ -65,6 +65,55 @@ def dist_ahead(ego, npc):
         d   = npc.get_transform().location - tf.location
         return d.x*fwd.x + d.y*fwd.y
     except: return 0.0
+
+
+def find_gap_in_lane(world, reference_actor, lane_id, min_gap_m=12.0,
+                     search_ahead_m=60.0):
+    """
+    Check if there is a gap of at least min_gap_m in lane_id,
+    searched from reference_actor's position forward up to search_ahead_m.
+    Returns (has_gap, gap_size, gap_start_distance).
+    Used by NPCs deciding whether it's safe to merge into a queue lane.
+    """
+    if not is_alive(reference_actor): return False, 0.0, 0.0
+    try:
+        ref_loc = reference_actor.get_transform().location
+        ref_fwd = reference_actor.get_transform().get_forward_vector()
+        actors  = world.get_actors().filter("vehicle.*")
+
+        in_lane = []
+        for a in actors:
+            if not is_alive(a) or a.id == reference_actor.id: continue
+            wp = world.get_map().get_waypoint(
+                a.get_transform().location, project_to_road=True,
+                lane_type=carla.LaneType.Driving)
+            if not wp or wp.lane_id != lane_id: continue
+            d = a.get_transform().location - ref_loc
+            # signed distance along reference's forward vector
+            dist = d.x*ref_fwd.x + d.y*ref_fwd.y
+            if -20.0 < dist < search_ahead_m:
+                in_lane.append((dist, a))
+
+        if not in_lane:
+            return True, 999.0, 0.0   # lane is empty nearby — safe
+
+        in_lane.sort(key=lambda x: x[0])
+
+        # Find largest gap, including the gap right at reference's own position (0)
+        prev_dist = -5.0   # small buffer behind reference
+        max_gap   = 0.0
+        gap_start = 0.0
+        for dist, _ in in_lane:
+            gap = dist - prev_dist
+            if gap > max_gap:
+                max_gap   = gap
+                gap_start = prev_dist
+            prev_dist = dist
+
+        return max_gap >= min_gap_m, max_gap, gap_start
+    except Exception as e:
+        print(f"[GapCheck] {e}")
+        return False, 0.0, 0.0
 
 
 def get_ego_wp(world, ego):
@@ -104,7 +153,10 @@ def spawn_at_wp(world, wp, model=None):
     bp   = None
     if model:
         found = blib.filter(model)
-        if found: bp = found[0]
+        if found:
+            bp = found[0]
+        else:
+            print(f"[Spawn] Model '{model}' not found — using fallback")
     if not bp:
         cars = [b for b in blib.filter("vehicle.*")
                 if "dreyevr" not in b.id
@@ -116,7 +168,12 @@ def spawn_at_wp(world, wp, model=None):
                        y=wp.transform.location.y,
                        z=wp.transform.location.z + 0.3),
         wp.transform.rotation)
-    return world.try_spawn_actor(bp, tf)
+    actor = world.try_spawn_actor(bp, tf)
+    if actor is None:
+        print(f"[Spawn] FAILED at x={wp.transform.location.x:.1f} "
+              f"y={wp.transform.location.y:.1f} lane={wp.lane_id} "
+              f"(collision or blocked spawn point)")
+    return actor
 
 
 def spawn_behind_in_lane(world, ego, lane_id, behind_m, model=None):
@@ -163,6 +220,88 @@ def spawn_ahead_in_lane(world, ego, lane_id, ahead_m, model=None):
     return npc
 
 
+# ── Background traffic ───────────────────────────────────────────────────────
+BACKGROUND_MODELS = [
+    "vehicle.audi.tt",
+    "vehicle.chevrolet.impala",
+    "vehicle.dodge.charger_2020",
+    "vehicle.ford.mustang",
+    "vehicle.lincoln.mkz_2017",
+    "vehicle.mini.cooper_s",
+    "vehicle.toyota.prius",
+    "vehicle.volkswagen.t2",
+    "vehicle.jeep.wrangler_rubicon",
+    "vehicle.nissan.patrol",
+]
+
+def spawn_background_traffic(world, ego, tm, num_vehicles=4):
+    """
+    Spawn background vehicles on lane -1 (fast lane) only.
+    They drive naturally via TM autopilot at varied speeds (90-120 km/h)
+    and never interact with scenario events on lanes -2/-3/-4.
+    Staggered at 120m intervals ahead of ego so they're visible but not crowding.
+    """
+    ego_wp = get_ego_wp(world, ego)
+    if not ego_wp: return []
+
+    lane1_wp = wp_in_lane(ego_wp, -1)
+    if not lane1_wp:
+        print("[BGTraffic] Could not find lane -1")
+        return []
+
+    spawned = []
+    blib    = world.get_blueprint_library()
+
+    for i in range(num_vehicles):
+        # Stagger vehicles: some ahead, some behind ego
+        offset_m = (i - num_vehicles // 2) * 120.0  # e.g. -240, -160, -80, 0, 80, 160
+
+        if offset_m >= 0:
+            wps = lane1_wp.next(offset_m + 40.0)
+        else:
+            wps = lane1_wp.previous(abs(offset_m))
+
+        if not wps: continue
+        wp = wps[0]
+        wp = wp_in_lane(wp, -1) or wp   # ensure lane -1
+
+        # Pick a random background model
+        model = random.choice(BACKGROUND_MODELS)
+        cars  = blib.filter(model)
+        bp    = cars[0] if cars else random.choice(
+            [b for b in blib.filter("vehicle.*")
+             if "dreyevr" not in b.id
+             and int(b.get_attribute("number_of_wheels")) == 4])
+        bp.set_attribute("role_name", "background")
+
+        tf = carla.Transform(
+            carla.Location(x=wp.transform.location.x,
+                           y=wp.transform.location.y,
+                           z=wp.transform.location.z + 0.3),
+            wp.transform.rotation)
+
+        npc = world.try_spawn_actor(bp, tf)
+        if not npc:
+            continue
+
+        # TM autopilot on lane -1, allow natural lane changes within lane 1 only
+        npc.set_autopilot(True, TM_PORT)
+        tm.auto_lane_change(npc, False)       # stay in lane -1
+        tm.ignore_lights_percentage(npc, 100)
+        tm.ignore_signs_percentage(npc, 100)
+        tm.ignore_vehicles_percentage(npc, 0) # respect other lane-1 vehicles
+        # Varied speeds 90-120 km/h
+        speed_kmh = random.uniform(105.0, ROAD_LIMIT)
+        tm.vehicle_percentage_speed_difference(npc, pct(speed_kmh))
+        spawned.append(npc)
+        print(f"[BGTraffic] id={npc.id}  model={bp.id}  "
+              f"lane={wp.lane_id}  speed={speed_kmh:.0f} km/h  "
+              f"offset={offset_m:.0f}m")
+
+    print(f"[BGTraffic] {len(spawned)} background vehicles in lane -1")
+    return spawned
+
+
 # ── Connect ───────────────────────────────────────────────────────────────────
 def connect_and_load(host, port, map_name="Town04"):
     client = carla.Client(host, port)
@@ -184,33 +323,48 @@ def find_ego_vehicle(world):
 
 
 # ── Indicator ─────────────────────────────────────────────────────────────────
-def show_indicator(world, npc, duration_s=2.5):
+def show_indicator(world, npc, duration_s=2.5, side="left"):
+    """
+    Draw an orange arrow indicator on the specified side of the NPC.
+    side="left"  -> points left  (used for lane-3 -> lane-2 merges)
+    side="right" -> points right (used for lane-3 -> lane-4 merges)
+    """
     if not is_alive(npc): return
     try:
         tf  = npc.get_transform(); fwd = tf.get_forward_vector()
-        left = carla.Location(x=tf.location.x + fwd.y*3.5,
-                               y=tf.location.y - fwd.x*3.5,
-                               z=tf.location.z + 1.5)
+        sign = 1.0 if side == "left" else -1.0
+        tip = carla.Location(x=tf.location.x + fwd.y*3.5*sign,
+                             y=tf.location.y - fwd.x*3.5*sign,
+                             z=tf.location.z + 1.5)
         world.debug.draw_arrow(
-            tf.location + carla.Location(z=1.0), left,
+            tf.location + carla.Location(z=1.0), tip,
             thickness=0.15, arrow_size=0.3,
             color=carla.Color(255, 165, 0),
             life_time=duration_s, persistent_lines=False)
     except: pass
 
 
+
 # ── NPC Controller ────────────────────────────────────────────────────────────
 class NPCController:
-    """Physics-ON, apply_control each tick. Steers toward target_lane waypoint."""
-    LOOKAHEAD = 8.0; KP_STEER = 1.2; MAX_STEER = 0.6
-
+    """
+    Physics-ON, apply_control each tick. Steers toward target_lane waypoint.
+    Lookahead scales with speed: at low congestion speeds (5-10 km/h) it
+    uses a short lookahead so the car follows the lane centerline tightly
+    (important near curves/exits); at highway speed it looks further ahead
+    for smooth, non-twitchy steering.
+    """
+    MIN_LOOKAHEAD = 3.0     # metres, used at very low speed (queue crawl)
+    MAX_LOOKAHEAD = 10.0    # metres, used at cruise/highway speed
+    KP_STEER = 1.2; MAX_STEER = 0.6
+ 
     def __init__(self, world, npc, target_lane):
         self.world=world; self.npc=npc; self.target_lane=target_lane
-
+ 
     def change_lane(self, lane_id):
         print(f"[NPC {self.npc.id}] Lane target → {lane_id}")
         self.target_lane = lane_id
-
+ 
     def in_target_lane(self):
         if not is_alive(self.npc): return False
         try:
@@ -219,15 +373,93 @@ class NPCController:
                 lane_type=carla.LaneType.Driving)
             return wp is not None and wp.lane_id == self.target_lane
         except: return False
-
+ 
+    def _lookahead_for_speed(self, speed_kmh):
+        """Scale lookahead distance with speed for stable tracking."""
+        # At 0 km/h -> MIN_LOOKAHEAD, at 100+ km/h -> MAX_LOOKAHEAD
+        t = max(0.0, min(1.0, speed_kmh / 100.0))
+        return self.MIN_LOOKAHEAD + t * (self.MAX_LOOKAHEAD - self.MIN_LOOKAHEAD)
+ 
+    def check_at_exit(self):
+        """
+        Returns True if NPC has reached the exit junction (road 275).
+        At that point we stop overriding steering and let physics/road
+        guide the vehicle naturally through the junction.
+        """
+        if not is_alive(self.npc): return False
+        try:
+            wp = self.world.get_map().get_waypoint(
+                self.npc.get_transform().location, project_to_road=True,
+                lane_type=carla.LaneType.Driving)
+            return wp is not None and wp.is_junction
+        except: return False
+ 
+    def _closest_vehicle_ahead(self, max_dist=25.0):
+        """
+        Find the closest vehicle directly ahead in the same lane.
+        Returns (distance, actor) or (None, None) if nothing within max_dist.
+        """
+        if not is_alive(self.npc): return None, None
+        try:
+            npc_tf  = self.npc.get_transform()
+            npc_loc = npc_tf.location
+            fwd     = npc_tf.get_forward_vector()
+            town_map = self.world.get_map()
+            npc_wp  = town_map.get_waypoint(npc_loc, project_to_road=True,
+                                             lane_type=carla.LaneType.Driving)
+            if not npc_wp: return None, None
+ 
+            closest_dist   = max_dist
+            closest_actor  = None
+ 
+            for actor in self.world.get_actors().filter("vehicle.*"):
+                if not is_alive(actor) or actor.id == self.npc.id:
+                    continue
+                a_loc = actor.get_transform().location
+                d     = a_loc - npc_loc
+                # Only consider vehicles ahead (positive dot product)
+                dot   = d.x*fwd.x + d.y*fwd.y
+                if dot <= 0 or dot > max_dist:
+                    continue
+                # Must be in the same lane
+                a_wp = town_map.get_waypoint(a_loc, project_to_road=True,
+                                              lane_type=carla.LaneType.Driving)
+                if a_wp and a_wp.lane_id == self.target_lane:
+                    if dot < closest_dist:
+                        closest_dist  = dot
+                        closest_actor = actor
+ 
+            return (closest_dist, closest_actor) if closest_actor else (None, None)
+        except:
+            return None, None
+ 
     def tick(self, target_kmh):
         if not is_alive(self.npc): return
         try:
             npc_tf = self.npc.get_transform()
             loc    = npc_tf.location
             fwd    = npc_tf.get_forward_vector()
-            look   = carla.Location(x=loc.x+fwd.x*self.LOOKAHEAD,
-                                    y=loc.y+fwd.y*self.LOOKAHEAD, z=loc.z)
+            spd    = kmh_of(self.npc)
+ 
+            # ── Following distance: override target speed if too close ──
+            MIN_FOLLOW_DIST = 6.0    # metres — minimum gap to vehicle ahead
+            SAFE_FOLLOW_DIST = 12.0  # metres — comfortable following gap
+            dist_ahead, leader = self._closest_vehicle_ahead(max_dist=25.0)
+            if dist_ahead is not None:
+                if dist_ahead < MIN_FOLLOW_DIST:
+                    # Too close — full stop
+                    target_kmh = 0.0
+                elif dist_ahead < SAFE_FOLLOW_DIST:
+                    # Proportionally slow down
+                    ratio      = (dist_ahead - MIN_FOLLOW_DIST) / (SAFE_FOLLOW_DIST - MIN_FOLLOW_DIST)
+                    leader_spd = kmh_of(leader) if leader else 0.0
+                    target_kmh = leader_spd * ratio
+ 
+            # ── Steering ───────────────────────────────────────────────
+            lookahead = self._lookahead_for_speed(spd)
+            look = carla.Location(x=loc.x+fwd.x*lookahead,
+                                  y=loc.y+fwd.y*lookahead, z=loc.z)
+ 
             town_map = self.world.get_map()
             wp = town_map.get_waypoint(look, project_to_road=True,
                                         lane_type=carla.LaneType.Driving)
@@ -235,22 +467,43 @@ class NPCController:
                 wp = town_map.get_waypoint(loc, project_to_road=True,
                                             lane_type=carla.LaneType.Driving)
             if not wp: return
-            tgt = wp_in_lane(wp, self.target_lane) or wp
+ 
+            # At junction (exit ramp): follow the road naturally,
+            # do not try to steer back to target_lane which may not
+            # exist on the exit road
+            cur_wp = town_map.get_waypoint(loc, project_to_road=True,
+                                            lane_type=carla.LaneType.Driving)
+            at_junction = cur_wp and cur_wp.is_junction
+ 
+            if at_junction:
+                # Simply steer toward the next waypoint ahead — follow road
+                nexts = cur_wp.next(lookahead)
+                tgt   = nexts[0] if nexts else cur_wp
+            else:
+                tgt = wp_in_lane(wp, self.target_lane) or wp
+ 
             to  = carla.Vector3D(tgt.transform.location.x-loc.x,
                                   tgt.transform.location.y-loc.y, 0.0)
             mag = math.sqrt(to.x**2+to.y**2)
             if mag>0.001: to.x/=mag; to.y/=mag
             cross = fwd.x*to.y - fwd.y*to.x
             steer = max(-self.MAX_STEER, min(self.MAX_STEER, self.KP_STEER*cross))
-            spd   = kmh_of(self.npc); err = target_kmh-spd
-            if err>0: th=min(1.0,err/20.0); br=0.0
-            else:     th=0.0; br=min(1.0,abs(err)/10.0)
+ 
+            # ── Speed control ──────────────────────────────────────────
+            err = target_kmh - spd
+            if target_kmh <= 0.0:
+                th = 0.0; br = 0.8   # firm brake when stopping
+            elif err > 0:
+                th = min(1.0, err/20.0); br = 0.0
+            else:
+                th = 0.0; br = min(1.0, abs(err)/10.0)
+ 
             self.npc.apply_control(carla.VehicleControl(
                 throttle=float(th), steer=float(steer),
                 brake=float(br), hand_brake=False))
         except Exception as e:
             print(f"[NPCCtrl] {e}")
-
+ 
 
 # ── A-Event (A1-A4): lane -3 → lane -2 ───────────────────────────────────────
 class AEvent:
@@ -302,13 +555,13 @@ class AEvent:
         ahead = dist_ahead(ego, self.npc)
 
         if self.state == "tailing":
-            self.ctrl.tick(max(ego_spd, 20.0))
+            self.ctrl.tick(max(ego_spd, 110.0))
             if t >= self.start_t: self._set_state("overtake", t)
             return f"{self.label} — tailing lane-3  {kmh_of(self.npc):.0f} km/h"
 
         elif self.state == "overtake":
             ramp = min((t-self._state_t)/5.0, 1.0)
-            spd  = ego_spd + ramp*(SPEED_CATCHUP-ego_spd)
+            spd  = max(ego_spd, ramp*(SPEED_CATCHUP + 20))
             self.ctrl.tick(spd)
             if ahead >= CUT_AHEAD_M:
                 if not self._ind_done:
@@ -327,7 +580,7 @@ class AEvent:
 
         elif self.state == "decel":
             progress = min((t-self._state_t)/self.decel_type.value, 1.0)
-            spd = SPEED_CRUISE + progress*(SPEED_SLOW-SPEED_CRUISE)
+            spd = SPEED_SLOW + progress*(SPEED_SLOW-SPEED_CRUISE)
             self.ctrl.tick(spd)
             if progress >= 1.0: self._set_state("tail_ego", t)
             return (f"{self.label} — decel ({self.decel_type.name})  "
@@ -339,8 +592,8 @@ class AEvent:
             return f"{self.label} — tail  {kmh_of(self.npc):.0f} km/h"
 
         elif self.state == "reaccel":
-            progress = min((t-self._state_t)/20.0, 1.0)
-            spd = SPEED_SLOW + progress*(SPEED_CRUISE-SPEED_SLOW)
+            progress = min((t-self._state_t)/self.decel_type.value, 1.0)
+            spd = SPEED_SLOW + progress*(SPEED_CRUISE-SPEED_SLOW) + 20
             self.ctrl.tick(spd)
             if progress >= 1.0: self._set_state("done", t)
             return f"{self.label} — reaccel  {kmh_of(self.npc):.0f} km/h"
@@ -354,7 +607,6 @@ class AEvent:
 
         return ""
 
-
 # ── Congestion cut-in: lane -2 → lane -3 (ego's congestion lane) ─────────────
 class CongestionCutIn:
     """
@@ -363,16 +615,18 @@ class CongestionCutIn:
     then cuts RIGHT into lane -3 (ego's lane) and brakes.
     solid_line=True = no indicator.
     """
-    def __init__(self, label, trigger_t, solid_line=False):
+    def __init__(self, label, trigger_t, solid_line=False,
+                 model="vehicle.audi.a2"):
         self.label      = label
         self.trigger_t  = trigger_t
         self.solid_line = solid_line
+        self.model      = model
         self.npc        = None
         self.ctrl       = None
         self.state      = "waiting"
         self._state_t   = 0.0
         self._ind_done  = False
-        print(f"[{label}] lane-2→lane-3  @ {trigger_t}s  "
+        print(f"[{label}] lane-3→lane-4  @ {trigger_t}s  model={model}  "
               f"solid={'YES' if solid_line else 'no'}")
 
     def _set_state(self, s, t):
@@ -388,11 +642,11 @@ class CongestionCutIn:
         if self.state == "waiting":
             if t >= self.trigger_t:
                 # Spawn in lane -2 (flowing), 15m behind ego
-                npc = spawn_behind_in_lane(world, ego, lane_id=-2,
-                                           behind_m=15.0, model="vehicle.audi.a2")
+                npc = spawn_behind_in_lane(world, ego, lane_id=-3,
+                                           behind_m=15.0, model=self.model)
                 if npc:
                     self.npc  = npc
-                    self.ctrl = NPCController(world, npc, target_lane=-2)
+                    self.ctrl = NPCController(world, npc, target_lane=-3)
                     self._set_state("overtake", t)
             return ""
 
@@ -400,42 +654,56 @@ class CongestionCutIn:
         ahead = dist_ahead(ego, self.npc)
 
         if self.state == "overtake":
-            # NPC in lane -2, drive at cruise speed (flowing traffic)
+            # NPC in lane -3, drive at cruise speed (flowing traffic)
             ramp = min((t-self._state_t)/5.0, 1.0)
-            spd  = SPEED_CONG_MAX + ramp*(SPEED_CRUISE-SPEED_CONG_MAX)
+            spd  = SPEED_CONG_MAX + ramp*(SPEED_CATCHUP-SPEED_SLOW)
             self.ctrl.tick(spd)
-            if ahead >= CUT_AHEAD_M:
-                if not self._ind_done:
-                    # Dashed = indicator ON (right blinker for lane -2→-3)
-                    if not self.solid_line:
-                        show_indicator(world, self.npc, 2.5)
-                        print(f"[{self.label}] Indicator ON (dashed line)")
-                    else:
-                        print(f"[{self.label}] No indicator (solid line violation)")
-                    self._ind_done = True
-                # Cut RIGHT: lane -2 → lane -3
-                self.ctrl.change_lane(-3)
-                self._set_state("cutin", t)
-            return f"{self.label} — lane-2 flowing  ahead={ahead:.0f}m"
+            if ahead >= 1.5: #CUT_AHEAD_M:
+                # Check for a real gap in lane -4 (the queue) before
+                # committing to merge — prevents crashing into queue
+                has_gap, gap_size, _ = find_gap_in_lane(
+                    world, self.npc, lane_id=-4, min_gap_m=12.0,
+                    search_ahead_m=60.0)
+
+                if has_gap:
+                    if not self._ind_done:
+                        if not self.solid_line:
+                            show_indicator(world, self.npc, 2.5, side="right")
+                            print(f"[{self.label}] Indicator ON (dashed)  "
+                                  f"gap={gap_size:.0f}m — merging")
+                        else:
+                            print(f"[{self.label}] No indicator (solid)  "
+                                  f"gap={gap_size:.0f}m — merging")
+                        self._ind_done = True
+                    # Cut RIGHT: lane -3 → lane -4
+                    self.ctrl.change_lane(-4)
+                    self._set_state("cutin", t)
+                else:
+                    # No room — keep pacing in lane -3 alongside the queue,
+                    # waiting for a gap to open up (natural behaviour)
+                    return (f"{self.label} — waiting for gap in queue  "
+                            f"gap={gap_size:.0f}m < 12m")
+            return f"{self.label} — lane-3 flowing  ahead={ahead:.0f}m"
 
         elif self.state == "cutin":
-            self.ctrl.tick(SPEED_CRUISE)
-            if self.ctrl.in_target_lane(): self._set_state("decel", t)
-            return f"{self.label} — cutting in lane-2→lane-3"
+            self.ctrl.tick(SPEED_CONG_MAX + 10)
+            if self.ctrl.in_target_lane(): self._set_state("queue", t)
+            return f"{self.label} — cutting in lane-3→lane-4"
 
         elif self.state == "decel":
-            progress = min((t-self._state_t)/3.0, 1.0)
-            spd = SPEED_CRUISE + progress*(SPEED_SLOW-SPEED_CRUISE)
-            self.ctrl.tick(spd)
-            if progress >= 1.0: self._set_state("cruise", t)
-            return f"{self.label} — decel  {kmh_of(self.npc):.0f} km/h"
+            # Decelerate from cruise to queue speed (5-10 km/h) over 5s
+            progress = min((t-self._state_t)/5.0, 1.0)
+            self.ctrl.tick(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
+            if progress >= 1.0: self._set_state("queue", t)
+            return f"{self.label} — joining queue  {kmh_of(self.npc):.0f} km/h"
 
-        elif self.state == "cruise":
-            self.ctrl.tick(SPEED_SLOW)
+        elif self.state == "queue":
+            # Now crawling in queue at congestion speed
+            self.ctrl.tick(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
             if ahead > DESTROY_M or ahead < -50.0:
                 safe_destroy(self.npc); self.npc=None
                 return f"{self.label} — done"
-            return f"{self.label} — cruising  {kmh_of(self.npc):.0f} km/h"
+            return f"{self.label} — in queue  {kmh_of(self.npc):.0f} km/h"
 
         return ""
 
@@ -479,15 +747,14 @@ class ExitCutIn:
             ramp = min((t-self._state_t)/4.0, 1.0)
             spd  = ego_spd + ramp*(SPEED_CATCHUP-ego_spd)
             self.ctrl.tick(spd)
-            if ahead >= CUT_AHEAD_M:
-                print("[Exit] Sudden cut-in — NO indicator!")
-                # Cut LEFT into ego's lane (-3 → -2 near exit)
-                self.ctrl.change_lane(-2)
+            if ahead >= 1.5: #CUT_AHEAD_M:                print("[Exit] Sudden cut-in — NO indicator!")
+                # Cut LEFT into ego's lane (-3 → -4 near exit)
+                self.ctrl.change_lane(-4)
                 self._set_state("cutin", t)
             return f"Exit — overtaking  ahead={ahead:.0f}m"
 
         elif self.state == "cutin":
-            self.ctrl.tick(SPEED_CRUISE)
+            self.ctrl.tick(SPEED_CONG_MAX)
             if self.ctrl.in_target_lane(): self._set_state("hard_brake", t)
             return "Exit — cutting in"
 
@@ -577,6 +844,73 @@ def beep(world, loc):
         size=0.8,color=carla.Color(255,255,255),life_time=0.5)
     print("[BEEP] *** t=0 ***")
 
+def precise_respawn(vehicle, location, yaw=None, pitch=0.0, roll=0.0):
+
+    try:
+        # Convert inputs
+        if not isinstance(location, carla.Location):
+            location = carla.Location(*location)
+        
+        # Get or calculate yaw if not specified
+        if yaw is None:
+            waypoint = vehicle.get_world().get_map().get_waypoint(
+                location,
+                project_to_road=True
+            )
+            yaw = waypoint.transform.rotation.yaw if waypoint else 0.0
+        
+        # Create precise transform
+        transform = carla.Transform(
+            location,
+            carla.Rotation(
+                pitch=float(pitch),
+                yaw=float(yaw),
+                roll=float(roll)
+        ))
+        
+        # Disable physics for clean move
+        vehicle.set_simulate_physics(False)
+        
+        # Apply transform
+        vehicle.set_transform(transform)
+        
+        # Verify orientation
+        time.sleep(0.1)
+        current_yaw = vehicle.get_transform().rotation.yaw
+        yaw_diff = abs((current_yaw - yaw + 180) % 360 - 180)
+        
+        if yaw_diff > 5.0:  # More than 5 degrees off
+            # Correction attempt
+            correction = carla.Transform(
+                location,
+                carla.Rotation(pitch=pitch, yaw=yaw, roll=roll)
+            )
+            vehicle.set_transform(correction)
+            time.sleep(0.1)
+            yaw_diff = abs((vehicle.get_transform().rotation.yaw - yaw + 180) % 360 - 180)
+        
+        # Restore state
+        vehicle.set_simulate_physics(True)
+        vehicle.get_world().debug.draw_string(
+                carla.Location(x=location.x, y=location.y, z=location.z + 3.0),
+                "Speed limit: 50 km/h", draw_shadow=True,
+                color=carla.Color(255, 50, 50), life_time=10.0
+            )
+        
+        if yaw_diff <= 10.0:  # Acceptable threshold
+            # print(f"Respawn successful | Target yaw: {yaw:.1f}° | Actual yaw: {current_yaw:.1f}°")
+            return True
+        else:
+            # print(f"Orientation mismatch: {yaw_diff:.1f}° difference")
+            return False
+            
+    except Exception as e:
+        print(f"Respawn failed: {str(e)}")
+        try:
+            vehicle.set_simulate_physics(True)
+        except:
+            pass
+        return False
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -587,12 +921,19 @@ def main():
     tm = client.get_trafficmanager(TM_PORT)
     tm.set_synchronous_mode(False)
     tm.set_random_device_seed(42)
-    tm.set_global_distance_to_leading_vehicle(3.0)
+    tm.set_global_distance_to_leading_vehicle(4.0)
 
     try:
         ego = find_ego_vehicle(world)
+        success = precise_respawn(ego, carla.Location(x=65.25, y=-338.11, z=0.23), yaw=None)
+
         world.tick()
         beep(world, ego.get_transform().location)
+
+        # Spawn background traffic on lane -1 (fast lane, non-interfering)
+        bg_npcs = spawn_background_traffic(world, ego, tm, num_vehicles=6)
+        all_npcs.extend(bg_npcs)
+        world.tick()
 
         # A1-A4: NPCs in lane -3, cut left into lane -2
         a_events = [
@@ -604,10 +945,12 @@ def main():
 
         # Congestion cut-ins: NPCs in lane -2, cut right into lane -3
         c_events = [
-            CongestionCutIn("C1", 530.0, solid_line=False),
-            CongestionCutIn("C2", 595.0, solid_line=False),
-            CongestionCutIn("C3", 665.0, solid_line=False),
-            CongestionCutIn("C4", 755.0, solid_line=True),
+            CongestionCutIn("C1", 530.0, solid_line=False,
+                            model="vehicle.audi.a2"),
+            CongestionCutIn("C2", 595.0, solid_line=False,
+                            model="vehicle.citroen.c3"),
+            CongestionCutIn("C3", 665.0, solid_line=False,
+                            model="vehicle.seat.leon"),
         ]
 
         exit_event = ExitCutIn()
@@ -626,6 +969,74 @@ def main():
         prompted          = set()
         congestion_spawned= False
         recovery_started  = False
+
+         # ── Spawn congestion queue at fixed exit location ─────────────
+        ORIGINAL_EGO_SPAWN = carla.Location(x=125.25, y=-364.11, z=0.23)
+
+
+        print(f"[Congestion] Pre-spawning queue, vehicle 0 anchored 20m "
+              f"behind original ego spawn (x={ORIGINAL_EGO_SPAWN.x:.1f}, "
+              f"y={ORIGINAL_EGO_SPAWN.y:.1f})...")
+
+        spawn_wp = world.get_map().get_waypoint(
+            ORIGINAL_EGO_SPAWN, project_to_road=True,
+            lane_type=carla.LaneType.Driving)
+
+        if spawn_wp:
+            print(f"[Congestion] Original spawn wp: lane={spawn_wp.lane_id}  "
+                  f"x={spawn_wp.transform.location.x:.1f}  "
+                  f"y={spawn_wp.transform.location.y:.1f}  "
+                  f"road={spawn_wp.road_id}")
+
+            # Make sure we're in lane -4 (congestion/exit lane)
+            lane4_wp = wp_in_lane(spawn_wp, -4) or spawn_wp
+            print(f"[Congestion] Lane -4 at spawn: "
+                  f"x={lane4_wp.transform.location.x:.1f}  "
+                  f"y={lane4_wp.transform.location.y:.1f}")
+
+            # Determine which direction (next/previous) keeps us ON THE
+            # HIGHWAY (road 43) vs drifting onto the exit ramp (road 275).
+            # That verified direction is "toward the exit / along the highway".
+            # Vehicle 0 (front of queue, closest to exit) spawns near the
+            # original spawn point itself (small offset), and each
+            # subsequent vehicle steps further using the SAME direction
+            # — meaning they get progressively FURTHER from the exit,
+            # which is what a real queue looks like (front car nearest
+            # the bottleneck, rest trailing back).
+            original_road = lane4_wp.road_id
+
+            test_prev = lane4_wp.previous(20.0)
+            test_next = lane4_wp.next(20.0)
+
+            if test_next and test_next[0].road_id == original_road:
+                step_func_name = "next"
+            elif test_prev and test_prev[0].road_id == original_road:
+                step_func_name = "previous"
+            else:
+                step_func_name = "previous"
+                print(f"[Congestion] WARNING: could not verify direction, "
+                      f"defaulting to previous()")
+
+            print(f"[Congestion] Highway direction confirmed: {step_func_name}()")
+
+            # Vehicle 0 starts close to the exit — use the OPPOSITE of the
+            # step direction by a small amount (2m) so it sits just before
+            # the exit junction, then subsequent vehicles step away using
+            # step_func_name (staying on the highway, away from exit).
+            if step_func_name == "next":
+                # next() moves toward exit -> vehicle 0 should be near exit
+                # so step BACKWARD slightly less, queue steps forward (next)
+                close = lane4_wp.previous(2.0)
+                cur_wp = close[0] if close else lane4_wp
+            else:
+                close = lane4_wp.next(2.0)
+                cur_wp = close[0] if close else lane4_wp
+
+            cur_wp = wp_in_lane(cur_wp, -4) or cur_wp
+            print(f"[Congestion] Vehicle 0 placed: road={cur_wp.road_id}  "
+                  f"x={cur_wp.transform.location.x:.1f}  "
+                  f"y={cur_wp.transform.location.y:.1f}")
+
 
         monitor      = SpeedMonitor(world, ego)
         status_every = int(2.0 / FDS)
@@ -649,35 +1060,39 @@ def main():
                     if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
                         all_npcs.append(ev.npc)
 
-            # ── Spawn congestion queue at t=500 AHEAD in lane -3 ──────
-            if not congestion_spawned and t >= 500.0:
-                print("\n[Congestion] Spawning queue in lane -3 AHEAD of ego...")
-                beep(world, ego.get_transform().location)
-                ego_wp = get_ego_wp(world, ego)
-                if ego_wp:
-                    lane3_wp = wp_in_lane(ego_wp, -3)
-                    if lane3_wp:
-                        for i in range(NUM_CONG_VEHS):
-                            ahead_m = 15.0 + i * 10.0
-                            nexts   = lane3_wp.next(ahead_m)
-                            if not nexts: continue
-                            wp = nexts[0]
-                            npc = spawn_at_wp(world, wp)
-                            if npc:
-                                npc.set_autopilot(True, TM_PORT)
-                                tm.auto_lane_change(npc, False)
-                                tm.ignore_lights_percentage(npc, 100)
-                                tm.vehicle_percentage_speed_difference(
-                                    npc, pct(random.uniform(
-                                        SPEED_CONG_MIN, SPEED_CONG_MAX)))
-                                congestion_npcs.append(npc)
-                                all_npcs.append(npc)
-                print(f"[Congestion] {len(congestion_npcs)} vehicles in lane -3")
-                congestion_spawned = True
+            # ── Spawn congestion queue at t=460 in lane -4 ──────
+            if not congestion_spawned and t >= 460.0:
+                for i in range(NUM_CONG_VEHS):
+                    if cur_wp is None:
+                        print(f"[Congestion] cur_wp is None at vehicle {i} — stopping")
+                        break
+                    print(f"[Congestion] Spawning vehicle {i}: "
+                        f"lane={cur_wp.lane_id}  "
+                        f"x={cur_wp.transform.location.x:.1f}  "
+                        f"y={cur_wp.transform.location.y:.1f}")
+                    npc = spawn_at_wp(world, cur_wp)
+                    if npc:
+                        npc.set_autopilot(True, TM_PORT)
+                        tm.auto_lane_change(npc, False)
+                        tm.ignore_lights_percentage(npc, 100)
+                        tm.ignore_signs_percentage(npc, 100)
+                        tm.vehicle_percentage_speed_difference(
+                            npc, pct(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX)))
+                        congestion_npcs.append(npc)
+                        all_npcs.append(npc)
+                    # Step further AWAY from exit using the verified direction
+                    if step_func_name == "next":
+                        nxt = cur_wp.next(12.0)
+                    else:
+                        nxt = cur_wp.previous(12.0)
+                    cur_wp = nxt[0] if nxt else None
+                    print(f"[Congestion] {len(congestion_npcs)} vehicles pre-spawned, "
+                        f"queue ending at exit location")
+                    congestion_spawned = True
 
-            # ── 500-750s: congestion ──────────────────────────────────
+            # ── 500-750s: congestion (queue was pre-spawned at t=0) ──
             if 500.0 <= t < 750.0:
-                label = (f"Congestion — ego in lane-3  "
+                label = (f"Congestion — ego should be in lane-4  "
                          f"{SPEED_CONG_MIN:.0f}-{SPEED_CONG_MAX:.0f} km/h")
                 # Maintain slow speed in lane -3
                 for npc in congestion_npcs:
@@ -695,9 +1110,9 @@ def main():
             elif 750.0 <= t < 800.0:
                 if not recovery_started:
                     print("[Congestion] Recovery starting...")
-                    recovery_started = True
+                    recovery_started = True 
                 progress     = (t-750.0)/50.0
-                recovery_spd = SPEED_CONG_MAX + progress*(SPEED_CRUISE-SPEED_CONG_MAX)
+                recovery_spd = SPEED_CONG_MAX + progress*(SPEED_CRUISE-SPEED_CONG_MAX) + 20
                 label        = f"Recovery — lane-3 → {recovery_spd:.0f} km/h"
                 for npc in congestion_npcs:
                     if is_alive(npc):
