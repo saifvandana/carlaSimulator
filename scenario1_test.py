@@ -27,7 +27,7 @@ SPEED_RECOVERY_MAX = 50.0
 CUT_AHEAD_M     = 5.0
 SPAWN_BEFORE_S  = 10.0
 DESTROY_M       = 300.0
-NUM_CONG_VEHS   = 10
+NUM_CONG_VEHS   = 8
 
 SPEED_LOW  = 100.0; SPEED_HIGH = 105.0
 WARN_LOW   = 90.0;  WARN_DELAY = 20.0
@@ -978,7 +978,27 @@ class SimpleCrashDetector:
             pass
             
         return False
-    
+
+import subprocess
+import sys
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+# ── Rating prompts ────────────────────────────────────────────────────────────
+# (trigger_t, display_s, title, line1, line2, spoken_text)
+ 
+def _speak(text: str):
+    """Speak text in a separate process — no audio device conflicts."""
+    script = (
+        "import pyttsx3; e=pyttsx3.init(); "
+        "e.setProperty('rate',155); e.setProperty('volume',1.0); "
+        f"e.say({repr(text)}); e.runAndWait()"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     client, world = connect_and_load(CARLA_HOST, CARLA_PORT)
@@ -1033,10 +1053,10 @@ def main():
 
         rating_schedule = {
             120.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            210.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            300.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            385.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            525.0: "How much anger or frustration do you feel\ndue to the current traffic congestion?",
+            230.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            320.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            440.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            545.0: "How much anger or frustration do you feel\ndue to the current traffic congestion?",
             570.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
             635.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
             705.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
@@ -1216,6 +1236,7 @@ def main():
             for pt, msg in rating_schedule.items():
                 if t >= pt and pt not in prompted:
                     show_rating(world, ego, msg, duration_s=15.0)
+                    _speak(msg)
                     prompted.add(pt)
 
             # ── Crash detection ─────────────────────────────────────────

@@ -19,15 +19,15 @@ SPEED_CATCHUP   = 110.0
 SPEED_SLOW      = 70.0
 
 # Congestion speed profile
-SPEED_CONG_MIN  = 5.0
-SPEED_CONG_MAX  = 10.0
+SPEED_CONG_MIN  = 3.0
+SPEED_CONG_MAX  = 8.0
 SPEED_RECOVERY_MIN = 10.0
 SPEED_RECOVERY_MAX = 50.0
 
 CUT_AHEAD_M     = 5.0
 SPAWN_BEFORE_S  = 10.0
-DESTROY_M       = 300.0
-NUM_CONG_VEHS   = 10
+DESTROY_M       = 100.0
+NUM_CONG_VEHS   = 9
 
 SPEED_LOW  = 100.0; SPEED_HIGH = 105.0
 WARN_LOW   = 90.0;  WARN_DELAY = 20.0
@@ -88,6 +88,12 @@ def wp_in_lane(wp, target_lane_id):
 def spawn_at_wp(world, wp, model=None):
     blib = world.get_blueprint_library()
     bp   = None
+    models    = [
+            "vehicle.audi.tt",          "vehicle.chevrolet.impala",
+            "vehicle.ford.mustang",     "vehicle.lincoln.mkz_2017",
+            "vehicle.toyota.prius",     "vehicle.dodge.charger_2020",
+            "vehicle.mini.cooper_s",    "vehicle.seat.leon",
+        ]
     if model:
         found = blib.filter(model)
         if found:
@@ -95,7 +101,7 @@ def spawn_at_wp(world, wp, model=None):
         else:
             print(f"[Spawn] Model '{model}' not found — using fallback")
     if not bp:
-        cars = [b for b in blib.filter("vehicle.*")
+        cars = [b for b in blib.filter("random.choice(models)")
                 if "dreyevr" not in b.id
                 and int(b.get_attribute("number_of_wheels")) == 4]
         bp = random.choice(cars) if cars else blib.find("vehicle.tesla.model3")
@@ -582,7 +588,7 @@ class AEvent:
 
         elif self.state == "overtake":
             ramp = min((t-self._state_t)/5.0, 1.0)
-            spd = max(ego_spd, ramp*(SPEED_CATCHUP + 10))
+            spd = max(ego_spd, ramp*(SPEED_CATCHUP + 10)) + 15
             self.ctrl.tick(spd)
             if ahead >= CUT_AHEAD_M:
                 if not self._ind_done:
@@ -977,7 +983,219 @@ class SimpleCrashDetector:
         except:
             pass
             
-        return False
+
+
+import subprocess
+import sys
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+# ── Rating prompts ────────────────────────────────────────────────────────────
+# (trigger_t, display_s, title, line1, line2, spoken_text)
+ 
+def _speak(text: str):
+    """Speak text in a separate process — no audio device conflicts."""
+    script = (
+        "import pyttsx3; e=pyttsx3.init(); "
+        "e.setProperty('rate',155); e.setProperty('volume',1.0); "
+        f"e.say({repr(text)}); e.runAndWait()"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+
+import pygame
+import numpy as np
+import os
+import threading
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+WIDTH, HEIGHT   = 1280, 720
+GREEN           = (0, 255, 70)
+WHITE           = (255, 255, 255)
+SHADOW          = (0, 60, 0)
+MSG_SHADOW      = (60, 60, 60)
+FONT_SIZE       = 300
+MSG_FONT_SIZE   = 45
+ 
+COUNTDOWN_STEPS = ["3", "2", "1", "GO!"]
+STEP_DURATION   = 1.5
+GO_DURATION     = 1.5
+MSG_DURATION    = 3.0       # seconds each message stays on screen
+ 
+# (trigger_time_seconds, message_text)
+# TIMED_MESSAGES = [
+#     (0.2,  "The speed limit is 50 km/h. Stay in lane 2"),
+#     (50,  "Stay in lane 2 and proceed straight. Watch for pedestrians."),
+# ]
+
+# ── Pygame helpers ────────────────────────────────────────────────────────────
+# Colour key used as the transparent background (must not appear in text)
+TRANSPARENT_COLOR = (1, 1, 1)
+ 
+def get_carla_window_position():
+    """
+    Find the CARLA/UE4 window and return its (x, y) top-left position
+    so Pygame can be placed on the same screen.
+    Returns (0, 0) if the window cannot be found.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+ 
+        found = []
+ 
+        def callback(hwnd, _):
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+                title = buf.value.lower()
+                if "CarlaUE4" in title or "carla" in title or "unreal" in title:
+                    rect = ctypes.wintypes.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                    found.append((rect.left, rect.top))
+            return True
+ 
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(callback), 0)
+ 
+        if found:
+            print(f"[INFO] CARLA window found at {found[0]}")
+            return found[0]
+    except Exception as e:
+        print(f"[WARN] Could not detect CARLA window position: {e}")
+ 
+    return (0, 0)
+
+
+def open_pygame_window():
+    """
+    Open a borderless, transparent-background Pygame window.
+    The TRANSPARENT_COLOR is set as the window colour key so every pixel
+    of that colour becomes see-through, leaving only the text visible.
+    """
+    # Centre the Pygame window on the same screen as CARLA.
+    # We temporarily init the display just to read the desktop size,
+    # then use that to compute the centred position before the real init.
+    carla_x, carla_y = -8, -20#get_carla_window_position()
+    try:
+        if not pygame.display.get_init():
+            pygame.display.init()
+        screen_w, screen_h = pygame.display.get_desktop_sizes()[0]
+    except Exception:
+        screen_w, screen_h = 1920, 1080   # safe fallback
+    centre_x = carla_x + (screen_w  // 2) - (WIDTH  // 2)
+    centre_y = carla_y + (screen_h // 2) - (HEIGHT // 2)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{centre_x},{centre_y}"
+ 
+    # Only init the display subsystem — never the mixer.
+    # Calling pygame.init() would reset the mixer and kill any
+    # audio (e.g. horn sounds) already running in another module.
+    if not pygame.get_init():
+        pygame.display.init()
+        pygame.font.init()
+    screen = pygame.display.set_mode(
+        (WIDTH, HEIGHT),
+        pygame.NOFRAME,          # no title bar / border
+    )
+    pygame.display.set_caption("CARLA Scenario")
+ 
+    # Make TRANSPARENT_COLOR invisible at the OS level (Windows + most Linux)
+    hwnd_set = False
+    try:
+        import ctypes
+        hwnd = pygame.display.get_wm_info()["window"]
+        # WS_EX_LAYERED = 0x80000, LWA_COLORKEY = 0x1
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20,
+            ctypes.windll.user32.GetWindowLongW(hwnd, -20) | 0x80000)
+        ctypes.windll.user32.SetLayeredWindowAttributes(
+            hwnd, RGB(*TRANSPARENT_COLOR), 0, 0x1)
+        hwnd_set = True
+    except Exception:
+        pass   # non-Windows: colour key won't be OS-transparent but text still shows
+ 
+    # Always set Pygame's own colour key so blit compositing is correct
+    screen.set_colorkey(TRANSPARENT_COLOR)
+ 
+    clock    = pygame.time.Clock()
+    font_big = pygame.font.SysFont("Arial", FONT_SIZE,     bold=True)
+    font_msg = pygame.font.SysFont("Arial", MSG_FONT_SIZE, bold=True)
+    return screen, clock, font_big, font_msg
+
+ 
+def RGB(r, g, b):
+    """Pack r,g,b into a single COLORREF int for Win32."""
+    return r | (g << 8) | (b << 16)
+ 
+ 
+def draw_text_centred(screen, font, text, color, shadow_color, offset=(8, 8), padding_top=40):
+    """Draw text horizontally centred at the top of the screen."""
+    shadow_surf = font.render(text, True, shadow_color)
+    text_surf   = font.render(text, True, color)
+    cx = WIDTH // 2 - text_surf.get_width() // 2
+    cy = padding_top
+    screen.blit(shadow_surf, (cx + offset[0], cy + offset[1]))
+    screen.blit(text_surf,   (cx, cy))
+ 
+ 
+def draw_background(screen):
+    """Fill with the transparent colour key — no camera feed, no overlay."""
+    screen.fill(TRANSPARENT_COLOR)
+ 
+ 
+def close_pygame():
+    # Only quit the display subsystem, not the mixer.
+    # pygame.quit() would shut down audio and break horn sounds.
+    if pygame.display.get_init():
+        pygame.display.quit()
+ 
+ 
+# ── Countdown ─────────────────────────────────────────────────────────────────
+def show_countdown(world):
+    """Display 3-2-1-GO! in a Pygame window. Closes the window after GO!"""
+    screen, clock, font_big, _ = open_pygame_window()
+    durations = [STEP_DURATION] * 3 + [GO_DURATION]
+ 
+    for label, duration in zip(COUNTDOWN_STEPS, durations):
+        t_start = time.time()
+        while time.time() - t_start < duration:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    close_pygame()
+                    return
+            draw_background(screen)
+            draw_text_centred(screen, font_big, label, GREEN, SHADOW)
+            pygame.display.flip()
+            clock.tick(60)
+            world.tick()
+        print(f"[countdown] {label}")
+ 
+    close_pygame()
+
+# ── Timed message ─────────────────────────────────────────────────────────────
+def show_message(world, clock_ref, message):
+    """
+    Open a Pygame window, display `message` for MSG_DURATION seconds,
+    then close it. Keeps ticking the CARLA world while open.
+    """
+    screen, clock, _, font_msg = open_pygame_window()
+    t_start = time.time()
+ 
+    while time.time() - t_start < MSG_DURATION:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                break
+        draw_background(screen)
+        draw_text_centred(screen, font_msg, message, WHITE, MSG_SHADOW)
+        pygame.display.flip()
+        clock.tick(60)
+        world.tick()
+ 
+    close_pygame()
+    print(f"[message] '{message}' closed")
+    return False
     
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -1014,33 +1232,39 @@ def main():
         all_npcs.extend(bg_npcs)
         world.tick()
 
+        print("Starting countdown ...")
+        show_countdown(world)
+
         # A1-A4 events
         a_events = [
-            AEvent("A1", True,  DecelType.RAPID,    60.0, "vehicle.audi.tt"),
-            AEvent("A2", True,  DecelType.GRADUAL, 170.0, "vehicle.bmw.grandtourer"),
-            AEvent("A3", False, DecelType.RAPID,   280.0, "vehicle.mercedes.coupe"),
-            AEvent("A4", False, DecelType.GRADUAL, 390.0, "vehicle.dodge.charger_2020"),
+            AEvent("A1", True,  DecelType.RAPID,    50.0, "vehicle.audi.tt"),
+            AEvent("A2", True,  DecelType.GRADUAL, 150.0, "vehicle.bmw.grandtourer"),
+            AEvent("A3", False, DecelType.RAPID,   300.0, "vehicle.mercedes.coupe"),
+            AEvent("A4", False, DecelType.GRADUAL, 460.0, "vehicle.dodge.charger_2020"),
         ]
 
         # Congestion cut-ins (pass queue_manager to each)
         c_events = [
-            CongestionCutIn("C1", 545.0, queue_manager, solid_line=False, model="vehicle.dodge.charger_2020"),
-            CongestionCutIn("C2", 615.0, queue_manager, solid_line=False, model="vehicle.audi.tt"),
-            CongestionCutIn("C3", 685.0, queue_manager, solid_line=False, model="vehicle.ford.mustang"),
+            CongestionCutIn("C1", 825.0, queue_manager, solid_line=False, model="vehicle.dodge.charger_2020"),
+            CongestionCutIn("C2", 890.0, queue_manager, solid_line=False, model="vehicle.audi.tt"),
+            CongestionCutIn("C3", 970.0, queue_manager, solid_line=False, model="vehicle.ford.mustang"),
         ]
 
         exit_event = ExitCutIn()
 
         rating_schedule = {
-            120.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            210.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            300.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            385.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
-            525.0: "How much anger or frustration do you feel\ndue to the current traffic congestion?",
-            570.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
-            635.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
-            705.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
-            805.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            1.0: "Stay in lane 2 and drive at 100-105 km/h.",
+            160.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            260.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            410.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            570.0: "How much anger or frustration did you feel\ndue to the vehicle cutting in and slowing down traffic?",
+            700.0: "Join the traffic ahead in lane 4",
+            730.0: "Join the traffic ahead in lane 4",
+            800.0: "How much anger or frustration do you feel\ndue to the current traffic congestion?",
+            865.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            930.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            1010.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
+            1100.0: "How much anger or frustration did you feel\ndue to the recent cut-in during congestion?",
         }
         prompted = set()
         congestion_spawned = False
@@ -1104,8 +1328,8 @@ def main():
             if tick_count % 10 == 0:  # Check every 10 ticks
                 keep_traffic_lights_green(world)
 
-            # ── A1-A4 (0-500s) ──────────────────────────────────────────
-            if t < 500.0:
+            # ── A1-A4 (0-650s) ──────────────────────────────────────────
+            if t <= 1250.0:
                 for ev in a_events:
                     lbl = ev.update(world, ego, t)
                     if lbl:
@@ -1113,8 +1337,8 @@ def main():
                     if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
                         all_npcs.append(ev.npc)
 
-            # ── Spawn congestion queue at t=450 ─────────────────────────
-            if not congestion_spawned and t >= 450.0:
+            # ── Spawn congestion queue at t=700 ─────────────────────────
+            if not congestion_spawned and t >= 720.0:
                 for i in range(NUM_CONG_VEHS):
                     if cur_wp is None:
                         print(f"[Congestion] cur_wp is None at vehicle {i}")
@@ -1140,7 +1364,7 @@ def main():
                 congestion_spawned = True
 
             # ── 500-750s: CONGESTION (VERY SLOW) ────────────────────────
-            if 520.0 <= t < 750.0:
+            if 830.0 <= t < 1000.0:
                 label = f"🚗 CONGESTION — 5-10 km/h (lane-4)"
                 
                 # Very slow speed: 5-10 km/h
@@ -1163,16 +1387,24 @@ def main():
                         all_npcs.append(ev.npc)
 
             # ── 750-800s: RECOVERY (GRADUAL ACCELERATION) ──────────────
-            elif 750.0 <= t < 790.0:
+            if 1000.0 <= t < 1205.0:
                 if not recovery_started:
                     print("[Congestion] 🚦 RECOVERY STARTING — Gradual acceleration...")
                     recovery_started = True
                 
-                progress = (t - 750.0) / 50.0
+                progress = (t - 1000.0) / 225.0
                 eased_progress = progress * progress * (3 - 2 * progress)
                 recovery_spd = SPEED_RECOVERY_MIN + eased_progress * (SPEED_RECOVERY_MAX - SPEED_RECOVERY_MIN)
                 
                 label = f"🚦 RECOVERY — {recovery_spd:.0f} km/h"
+
+                if t >= 1075.0:
+                    lbl = exit_event.update(world, ego, t)
+                    if lbl:
+                        label = lbl
+                    if (exit_event.npc and exit_event.npc not in all_npcs
+                            and is_alive(exit_event.npc)):
+                        all_npcs.append(exit_event.npc)
                 
                 # Update ALL queue vehicles with recovery speed
                 queue_manager.update_all(recovery_spd)
@@ -1196,7 +1428,7 @@ def main():
             #     queue_manager.update_all(40.0)
 
             # ── 810-890s: exit cut-in ──────────────────────────────────
-            elif 790.0 <= t < 890.0:
+            if 1075.0 <= t < 1205.0:
                 lbl = exit_event.update(world, ego, t)
                 if lbl:
                     label = lbl
@@ -1206,7 +1438,7 @@ def main():
                 
                 queue_manager.update_all(40.0)
 
-            elif t >= 890.0:
+            if t >= 1150.0:
                 label = "Cooldown"
                 removed = queue_manager.remove_at_exit()
                 if removed:
@@ -1216,6 +1448,7 @@ def main():
             for pt, msg in rating_schedule.items():
                 if t >= pt and pt not in prompted:
                     show_rating(world, ego, msg, duration_s=15.0)
+                    _speak(msg)
                     prompted.add(pt)
 
             # ── Crash detection ─────────────────────────────────────────
@@ -1235,8 +1468,8 @@ def main():
                       f"queue={alive_count}  avg_spd={avg_speed:>4.1f} km/h  "
                       f"bg={bg_count}  [{label[:30]}]")
 
-            if t >= 900.0:
-                print("\n[Scenario 1] Complete at T=900s.")
+            if t >= 1200.0:
+                print("\n[Scenario 1] Complete at T=1200s.")
                 break
 
             time.sleep(0.001)

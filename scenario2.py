@@ -13,13 +13,16 @@ No lane -4 blockers needed. Merge is into lane -3.
 """
 
 import carla, time, math, random
+from enum import Enum
+import os
+import threading
 
 CARLA_HOST = "localhost"
 CARLA_PORT = 2000
 FDS        = 0.05
 TM_PORT    = 8001
 
-EGO_SPAWN         = carla.Location(x=361.7, y=-168.5, z=0.3)
+EGO_SPAWN         = carla.Location(x=351.7, y=-168.5, z=0.3)
 MERGE_LOCATION    = carla.Location(x=381.9, y=-127.2, z=0.3)
 HIGHWAY_ENTRANCE      = carla.Location(x=381.9, y=-197.2, z=0.3)
 OBSTACLE_LOCATION = carla.Location(x=381.9, y=-107.2, z=0.3)
@@ -32,11 +35,13 @@ SPEED_SLOW      = 70.0
 
 CUT_AHEAD_M     = 5.0
 SPAWN_BEFORE_S  = 10.0
-DESTROY_M       = 300.0
-NUM_CONG_VEHS   = 10
+DESTROY_M       = 100.0
+NUM_CONG_VEHS   = 20
 
 SPEED_CONG_MIN = 5.0
 SPEED_CONG_MAX = 10.0
+SPEED_RECOVERY_MIN = 40.0
+SPEED_RECOVERY_MAX = 100.0
 SPEED_LOW      = 100.0; SPEED_HIGH = 105.0
 WARN_LOW       = 90.0;  WARN_DELAY = 20.0
 
@@ -46,7 +51,53 @@ COLOR_DANGER = carla.Color(255, 40, 40)
 COLOR_INFO   = carla.Color(100, 200, 255)
 COLOR_RATING = carla.Color(255, 255, 0)
 
+class DecelType(Enum):
+    RAPID   = 3.0
+    GRADUAL = 4.5
+
+# HORN_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "horn.wav")
+HORN_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preview.mp3")
+
+
+HORN_WINDOWS = [
+    (60.0,  80.0, 8.0),
+]
 # ── Utilities ─────────────────────────────────────────────────────────────────
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+
+class HornPlayer:
+    def __init__(self, wav_path):
+        self._sound = None
+        try:
+            import pygame
+            pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+            self._sound = pygame.mixer.Sound(wav_path)
+            print(f"[Horn] Loaded {wav_path}")
+        except Exception as e:
+            print(f"[Horn] WARNING: {e}")
+
+    def play(self):
+        if self._sound is None:
+            return
+        threading.Thread(target=self._sound.play, daemon=True).start()
+
+
+class HornScheduler:
+    def __init__(self, player):
+        self.player     = player
+        self._last_honk = -999.0
+
+    def update(self, t):
+        for (start, end, interval) in HORN_WINDOWS:
+            if start <= t <= end:
+                if t - self._last_honk >= interval:
+                    self.player.play()
+                    self._last_honk = t
+                    print(f"[Horn] HONK at t={t:.1f}s")
+                break
+
+
 def is_alive(a):
     try:    return a is not None and a.is_alive
     except: return False
@@ -382,11 +433,11 @@ class QueueManager:
             if qv.alive:
                 qv.update(target_speed)
                 
-    def remove_at_exit(self):
+    def remove_vehicles(self):
         """Remove vehicles that have reached the exit."""
         removed = []
         for qv in self.vehicles[:]:
-            if qv.alive and qv.is_at_exit():
+            if qv.alive:
                 print(f"[Queue] Vehicle {qv.npc.id} reached exit, removing...")
                 safe_destroy(qv.npc)
                 qv.alive = False
@@ -442,7 +493,7 @@ class CongestionQueueVehicle:
         except:
             return False
 
-# ── A-Event (A1-A4) ───────────────────────────────────────────────────────────
+# ── A-Event (A2-A4) ───────────────────────────────────────────────────────────
 class AEvent:
     def __init__(self, label, indicator, decel_type, start_t, model):
         self.label = label
@@ -456,7 +507,7 @@ class AEvent:
         self._state_t = 0.0
         self._ind_done = False
         self._spawn_t = start_t - SPAWN_BEFORE_S
-        print(f"[{label}] lane-3→lane-2  ind={'ON' if indicator else 'OFF'}  "
+        print(f"[{label}] lane-2→lane-1  ind={'ON' if indicator else 'OFF'}  "
               f"decel={decel_type.name}  spawn@{self._spawn_t:.0f}s")
 
     def _set_state(self, s, t):
@@ -476,11 +527,11 @@ class AEvent:
 
         if self.state == "waiting":
             if t >= self._spawn_t:
-                npc = spawn_behind_in_lane(world, ego, lane_id=-3,
+                npc = spawn_behind_in_lane(world, ego, lane_id=-2,
                                            behind_m=8.0, model=self.model)
                 if npc:
                     self.npc = npc
-                    self.ctrl = NPCController(world, npc, target_lane=-3)
+                    self.ctrl = NPCController(world, npc, target_lane=-2)
                     self._set_state("tailing", t)
                 else:
                     print(f"[{self.label}] spawn failed — retry")
@@ -488,6 +539,7 @@ class AEvent:
 
         if not is_alive(self.npc):
             return f"{self.label} (gone)"
+        
         ahead = dist_ahead(ego, self.npc)
 
         if self.state == "tailing":
@@ -505,14 +557,14 @@ class AEvent:
                     if self.indicator:
                         show_indicator(world, self.npc, 2.5)
                     self._ind_done = True
-                self.ctrl.change_lane(-2)
+                self.ctrl.change_lane(-1)
                 self._set_state("cutin", t)
             return f"{self.label} — overtaking"
 
         elif self.state == "cutin":
-            self.ctrl.tick(SPEED_CRUISE)
+            self.ctrl.tick(SPEED_SLOW)
             if self.ctrl.in_target_lane():
-                self._set_state("decel", t)
+                self._set_state("tail_ego", t)
             return f"{self.label} — cutting in"
 
         elif self.state == "decel":
@@ -525,13 +577,13 @@ class AEvent:
 
         elif self.state == "tail_ego":
             self.ctrl.tick(SPEED_SLOW)
-            if t-self._state_t >= 5.0:
+            if t-self._state_t >= 180.0:
                 self._set_state("reaccel", t)
             return f"{self.label} — tail"
 
         elif self.state == "reaccel":
             progress = min((t-self._state_t)/self.decel_type.value, 1.0)
-            spd = SPEED_SLOW + progress*(SPEED_CRUISE-SPEED_SLOW) + 20
+            spd = SPEED_SLOW + progress*(SPEED_CRUISE-SPEED_SLOW)
             self.ctrl.tick(spd)
             if progress >= 1.0:
                 self._set_state("done", t)
@@ -547,10 +599,82 @@ class AEvent:
 
         return ""
 
+# ── Pass-Event (P1-P3) ───────────────────────────────────────────────────────────
+class PEvent:
+    def __init__(self, label, indicator, decel_type, start_t, model):
+        self.label = label
+        self.indicator = indicator
+        self.decel_type = decel_type
+        self.start_t = start_t
+        self.model = model
+        self.npc = None
+        self.ctrl = None
+        self.state = "waiting"
+        self._state_t = 0.0
+        self._ind_done = False
+        self._spawn_t = start_t - SPAWN_BEFORE_S
+        print(f"[{label}] lane-2→lane-1  ind={'ON' if indicator else 'OFF'}  "
+              f"decel={decel_type.name}  spawn@{self._spawn_t:.0f}s")
+
+    def _set_state(self, s, t):
+        print(f"[{self.label}] {self.state} -> {s}  T={t:.1f}s")
+        self.state = s
+        self._state_t = t
+
+    def update(self, world, ego, t):
+        try:
+            return self._update(world, ego, t)
+        except Exception as e:
+            print(f"[{self.label}] err: {e}")
+            return ""
+
+    def _update(self, world, ego, t):
+        ego_spd = kmh_of(ego) if is_alive(ego) else SPEED_CRUISE
+
+        if self.state == "waiting":
+            if t >= self._spawn_t:
+                npc = spawn_behind_in_lane(world, ego, lane_id=-4,
+                                           behind_m=8.0, model=self.model)
+                if npc:
+                    self.npc = npc
+                    self.ctrl = NPCController(world, npc, target_lane=-4)
+                    self._set_state("tailing", t)
+                else:
+                    print(f"[{self.label}] spawn failed — retry")
+            return ""
+
+        if not is_alive(self.npc):
+            return f"{self.label} (gone)"
+        ahead = dist_ahead(ego, self.npc)
+
+        if self.state == "tailing":
+            self.ctrl.tick(max(ego_spd, 70.0))
+            if t >= self.start_t:
+                self._set_state("overtake", t)
+            return f"{self.label} — tailing"
+
+        elif self.state == "overtake":
+            ramp = min((t-self._state_t)/5.0, 1.0)
+            spd = max(ego_spd, ramp*(SPEED_CATCHUP + 10))
+            self.ctrl.tick(spd)
+            if ahead >= CUT_AHEAD_M:
+                self._set_state("done", t)
+            return f"{self.label} — overtaking"
+
+        elif self.state == "done":
+            self.ctrl.tick(SPEED_CRUISE)
+            if ahead > DESTROY_M or ahead < -50.0:
+                safe_destroy(self.npc)
+                self.npc = None
+                return f"{self.label} — done"
+            return f"{self.label} — cruising"
+
+        return ""
+
 # ── Congestion cut-in (FIXED: joins queue permanently) ──────────────────────
 class CongestionCutIn:
     """
-    NPC spawns in lane -2, cuts RIGHT into lane -4 (queue),
+    NPC spawns in lane -4, cuts left into lane -3 (queue),
     then joins the queue permanently.
     """
     def __init__(self, label, trigger_t, queue_manager, solid_line=False,
@@ -566,7 +690,7 @@ class CongestionCutIn:
         self._state_t = 0.0
         self._ind_done = False
         self._joined_queue = False
-        print(f"[{label}] lane-2→lane-4 (joins queue) @ {trigger_t}s  "
+        print(f"[{label}] lane-4→lane-3 (joins queue) @ {trigger_t}s  "
               f"solid={'YES' if solid_line else 'no'}")
 
     def _set_state(self, s, t):
@@ -584,12 +708,12 @@ class CongestionCutIn:
     def _update(self, world, ego, t):
         if self.state == "waiting":
             if t >= self.trigger_t:
-                # Spawn in lane -2 (flowing traffic)
-                npc = spawn_behind_in_lane(world, ego, lane_id=-3,
-                                           behind_m=15.0, model=self.model)
+                # Spawn in lane -4 (flowing traffic)
+                npc = spawn_behind_in_lane(world, ego, lane_id=-4,
+                                           behind_m=8.0, model=self.model)
                 if npc:
                     self.npc = npc
-                    self.ctrl = NPCController(world, npc, target_lane=-3)
+                    self.ctrl = NPCController(world, npc, target_lane=-4)
                     self._set_state("overtake", t)
                 else:
                     print(f"[{self.label}] spawn failed")
@@ -603,13 +727,13 @@ class CongestionCutIn:
         if self.state == "overtake":
             # Drive in lane -3 at speed to catch up to queue
             ramp = min((t-self._state_t)/5.0, 1.0)
-            spd = SPEED_CONG_MAX + ramp*(SPEED_CATCHUP-SPEED_SLOW-10)
+            spd = SPEED_CONG_MAX + ramp*(SPEED_CATCHUP-SPEED_SLOW)
             self.ctrl.tick(spd)
             
-            # Check if there's a gap in the queue (lane -4)
+            # Check if there's a gap in the queue (lane -3)
             has_gap, gap_size, _ = find_gap_in_lane(
-                world, self.npc, lane_id=-4, min_gap_m=10.0,
-                search_ahead_m=40.0)
+                world, self.npc, lane_id=-3, min_gap_m=2.0,
+                search_ahead_m=10.0)
                 
             if has_gap and ahead >= 1.0:
                 if not self._ind_done:
@@ -620,15 +744,15 @@ class CongestionCutIn:
                         print(f"[{self.label}] No indicator (solid line) — illegal merge")
                     self._ind_done = True
                     
-                # Cut RIGHT into lane -4 (queue lane)
-                self.ctrl.change_lane(-4)
+                # Cut RIGHT into lane -3 (queue lane)
+                self.ctrl.change_lane(-3)
                 self._set_state("merge", t)
                 return f"{self.label} — merging into queue (gap={gap_size:.0f}m)"
             else:
                 return f"{self.label} — pacing queue  gap={gap_size:.0f}m"
 
         elif self.state == "merge":
-            self.ctrl.tick(SPEED_CONG_MIN)
+            self.ctrl.tick(SPEED_CONG_MAX)
             if self.ctrl.in_target_lane():
                 print(f"[{self.label}] ✓ MERGED into queue!")
                 self._set_state("queue", t)
@@ -638,7 +762,7 @@ class CongestionCutIn:
             # JOIN THE QUEUE PERMANENTLY
             if not self._joined_queue:
                 print(f"[{self.label}] Adding to queue manager...")
-                self.queue_manager.add_cutin_vehicle(self.npc, world, target_lane=-4)
+                self.queue_manager.add_cutin_vehicle(self.npc, world, target_lane=-3)
                 self._joined_queue = True
                 self._set_state("following", t)
             return f"{self.label} — joined queue"
@@ -665,12 +789,6 @@ class CongestionVehicle:
 
 # ── Spawn congestion on lanes -1, -2, -3 (same logic as Scenario 1 queue) ────
 def spawn_congestion_lanes(world, num_per_lane):
-    """
-    Spawn congestion vehicles on road 36 lanes -1, -2, -3.
-    Each lane independently found by direct road+lane query.
-    Vehicles span 100m before to 150m after merge point (12m spacing).
-    Physics ON, NPCController — same as Scenario 1 queue.
-    """
     town_map  = world.get_map()
     all_wps   = town_map.generate_waypoints(5.0)
     all_vehs  = []
@@ -682,32 +800,48 @@ def spawn_congestion_lanes(world, num_per_lane):
         "vehicle.mini.cooper_s",    "vehicle.seat.leon",
     ]
 
-    # Reference waypoint near merge on road 36
-    merge_ref = town_map.get_waypoint(HIGHWAY_ENTRANCE, project_to_road=True,
+    ORIGINAL_CONGESTION_SPAWN = carla.Location(x=385.9, y=-249.2, z=0.3)
+    spawn_wp = town_map.get_waypoint(ORIGINAL_CONGESTION_SPAWN, project_to_road=True,
                                        lane_type=carla.LaneType.Driving)
-    if not merge_ref:
+    if not spawn_wp:
         print("[Congestion] No merge reference waypoint"); return []
-    ref_s = merge_ref.s
 
     for target_lane in [-1, -2, -3]:
-        # Find all waypoints on road 36 in this lane
-        lane_wps = [wp for wp in all_wps
-                    if wp.road_id == MERGE_ROAD and wp.lane_id == target_lane]
-        if not lane_wps:
-            print(f"[Congestion] Lane {target_lane}: no wps on road {MERGE_ROAD}")
-            continue
+        # Find the road-36 entry wp for this lane, then step back 5m to
+        # land on the actual highway road (35) that feeds it.
+        lane_wp = wp_in_lane(spawn_wp, target_lane) or spawn_wp
+        original_road = lane_wp.road_id
 
-        # Pick the waypoint closest to merge s-value as anchor
-        lane_wps.sort(key=lambda w: abs(w.s - ref_s))
-        anchor = lane_wps[0]
+        test_prev = lane_wp.previous(7.0)
+        test_next = lane_wp.next(7.0)
 
-        # Walk back 100m from anchor to get queue start
-        start_wps = anchor.previous(130.0)
-        cur_wp    = start_wps[0] if start_wps else anchor
+        if test_next and test_next[0].road_id == original_road:
+            step_func_name = "next"
+        elif test_prev and test_prev[0].road_id == original_road:
+            step_func_name = "previous"
+        else:
+            step_func_name = "previous"
+
+        print(f"[Congestion] Highway direction: {step_func_name}()")
+
+        if step_func_name == "next":
+            close = lane_wp.previous(2.0)
+            cur_wp = close[0] if close else lane_wp
+        else:
+            close = lane_wp.next(2.0)
+            cur_wp = close[0] if close else lane_wp
+
+        cur_wp = wp_in_lane(cur_wp, target_lane) or cur_wp
 
         spawned = 0
         for i in range(num_per_lane):
-        # don't try to walk lanes — use next() to stay on road
+            if cur_wp is None:
+                print(f"[Congestion] cur_wp is None at vehicle {i}")
+                break
+            print(f"[Congestion] Spawning vehicle {i}: "
+                    f"lane={cur_wp.lane_id}  "
+                    f"x={cur_wp.transform.location.x:.1f}  "
+                    f"y={cur_wp.transform.location.y:.1f}")
 
             bp = blib.filter(random.choice(models))
             if not bp: bp = blib.filter("vehicle.tesla.model3")
@@ -722,20 +856,22 @@ def spawn_congestion_lanes(world, num_per_lane):
                 cur_wp.transform.rotation)
 
             npc = world.try_spawn_actor(bp, tf)
-            if not npc:
-                # Try next position if blocked
-                continue
+            if npc:
+                npc.set_autopilot(False)
+                npc.set_simulate_physics(True)
+                all_vehs.append(CongestionVehicle(world, npc, target_lane))
+                spawned += 1
+                
+            if step_func_name == "next":
+                nxt = cur_wp.next(6.0)
+            else:
+                nxt = cur_wp.previous(6.0)
+            cur_wp = nxt[0] if nxt else None
+            print(f"[Congestion] Lane {target_lane}: {spawned}/{num_per_lane} spawned")
 
-            npc.set_autopilot(False)
-            npc.set_simulate_physics(True)
-            all_vehs.append(CongestionVehicle(world, npc, target_lane))
-            spawned += 1
-
-        print(f"[Congestion] Lane {target_lane}: {spawned}/{num_per_lane} spawned")
 
     print(f"[Congestion] Total: {len(all_vehs)} vehicles across lanes -1/-2/-3")
     return all_vehs
-
 
 # ── Construction zone obstacle ────────────────────────────────────────────────
 def spawn_obstacle(world):
@@ -1025,6 +1161,215 @@ class SimpleCrashDetector:
             pass
             
         return False
+import subprocess
+import sys
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+# ── Rating prompts ────────────────────────────────────────────────────────────
+# (trigger_t, display_s, title, line1, line2, spoken_text)
+ 
+def _speak(text: str):
+    """Speak text in a separate process — no audio device conflicts."""
+    script = (
+        "import pyttsx3; e=pyttsx3.init(); "
+        "e.setProperty('rate',155); e.setProperty('volume',1.0); "
+        f"e.say({repr(text)}); e.runAndWait()"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+
+import pygame
+import numpy as np
+ 
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+WIDTH, HEIGHT   = 1280, 720
+GREEN           = (0, 255, 70)
+WHITE           = (255, 255, 255)
+SHADOW          = (0, 60, 0)
+MSG_SHADOW      = (60, 60, 60)
+FONT_SIZE       = 300
+MSG_FONT_SIZE   = 45
+ 
+COUNTDOWN_STEPS = ["3", "2", "1", "GO!"]
+STEP_DURATION   = 1.5
+GO_DURATION     = 1.5
+MSG_DURATION    = 3.0       # seconds each message stays on screen
+ 
+# (trigger_time_seconds, message_text)
+TIMED_MESSAGES = [
+    (0.2,  "The speed limit is 50 km/h. Stay in lane 2"),
+    (50,  "Stay in lane 2 and proceed straight. Watch for pedestrians."),
+]
+
+# ── Pygame helpers ────────────────────────────────────────────────────────────
+# Colour key used as the transparent background (must not appear in text)
+TRANSPARENT_COLOR = (1, 1, 1)
+ 
+def get_carla_window_position():
+    """
+    Find the CARLA/UE4 window and return its (x, y) top-left position
+    so Pygame can be placed on the same screen.
+    Returns (0, 0) if the window cannot be found.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+ 
+        found = []
+ 
+        def callback(hwnd, _):
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+                title = buf.value.lower()
+                if "CarlaUE4" in title or "carla" in title or "unreal" in title:
+                    rect = ctypes.wintypes.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                    found.append((rect.left, rect.top))
+            return True
+ 
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(callback), 0)
+ 
+        if found:
+            print(f"[INFO] CARLA window found at {found[0]}")
+            return found[0]
+    except Exception as e:
+        print(f"[WARN] Could not detect CARLA window position: {e}")
+ 
+    return (0, 0)
+
+
+def open_pygame_window():
+    """
+    Open a borderless, transparent-background Pygame window.
+    The TRANSPARENT_COLOR is set as the window colour key so every pixel
+    of that colour becomes see-through, leaving only the text visible.
+    """
+    # Centre the Pygame window on the same screen as CARLA.
+    # We temporarily init the display just to read the desktop size,
+    # then use that to compute the centred position before the real init.
+    carla_x, carla_y = -8, -20#get_carla_window_position()
+    try:
+        if not pygame.display.get_init():
+            pygame.display.init()
+        screen_w, screen_h = pygame.display.get_desktop_sizes()[0]
+    except Exception:
+        screen_w, screen_h = 1920, 1080   # safe fallback
+    centre_x = carla_x + (screen_w  // 2) - (WIDTH  // 2)
+    centre_y = carla_y + (screen_h // 2) - (HEIGHT // 2)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{centre_x},{centre_y}"
+ 
+    # Only init the display subsystem — never the mixer.
+    # Calling pygame.init() would reset the mixer and kill any
+    # audio (e.g. horn sounds) already running in another module.
+    if not pygame.get_init():
+        pygame.display.init()
+        pygame.font.init()
+    screen = pygame.display.set_mode(
+        (WIDTH, HEIGHT),
+        pygame.NOFRAME,          # no title bar / border
+    )
+    pygame.display.set_caption("CARLA Scenario")
+ 
+    # Make TRANSPARENT_COLOR invisible at the OS level (Windows + most Linux)
+    hwnd_set = False
+    try:
+        import ctypes
+        hwnd = pygame.display.get_wm_info()["window"]
+        # WS_EX_LAYERED = 0x80000, LWA_COLORKEY = 0x1
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20,
+            ctypes.windll.user32.GetWindowLongW(hwnd, -20) | 0x80000)
+        ctypes.windll.user32.SetLayeredWindowAttributes(
+            hwnd, RGB(*TRANSPARENT_COLOR), 0, 0x1)
+        hwnd_set = True
+    except Exception:
+        pass   # non-Windows: colour key won't be OS-transparent but text still shows
+ 
+    # Always set Pygame's own colour key so blit compositing is correct
+    screen.set_colorkey(TRANSPARENT_COLOR)
+ 
+    clock    = pygame.time.Clock()
+    font_big = pygame.font.SysFont("Arial", FONT_SIZE,     bold=True)
+    font_msg = pygame.font.SysFont("Arial", MSG_FONT_SIZE, bold=True)
+    return screen, clock, font_big, font_msg
+
+ 
+def RGB(r, g, b):
+    """Pack r,g,b into a single COLORREF int for Win32."""
+    return r | (g << 8) | (b << 16)
+ 
+ 
+def draw_text_centred(screen, font, text, color, shadow_color, offset=(8, 8), padding_top=40):
+    """Draw text horizontally centred at the top of the screen."""
+    shadow_surf = font.render(text, True, shadow_color)
+    text_surf   = font.render(text, True, color)
+    cx = WIDTH // 2 - text_surf.get_width() // 2
+    cy = padding_top
+    screen.blit(shadow_surf, (cx + offset[0], cy + offset[1]))
+    screen.blit(text_surf,   (cx, cy))
+ 
+ 
+def draw_background(screen):
+    """Fill with the transparent colour key — no camera feed, no overlay."""
+    screen.fill(TRANSPARENT_COLOR)
+ 
+ 
+def close_pygame():
+    # Only quit the display subsystem, not the mixer.
+    # pygame.quit() would shut down audio and break horn sounds.
+    if pygame.display.get_init():
+        pygame.display.quit()
+ 
+ 
+# ── Countdown ─────────────────────────────────────────────────────────────────
+def show_countdown(world):
+    """Display 3-2-1-GO! in a Pygame window. Closes the window after GO!"""
+    screen, clock, font_big, _ = open_pygame_window()
+    durations = [STEP_DURATION] * 3 + [GO_DURATION]
+ 
+    for label, duration in zip(COUNTDOWN_STEPS, durations):
+        t_start = time.time()
+        while time.time() - t_start < duration:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    close_pygame()
+                    return
+            draw_background(screen)
+            draw_text_centred(screen, font_big, label, GREEN, SHADOW)
+            pygame.display.flip()
+            # clock.tick(60)
+            # world.tick()
+        print(f"[countdown] {label}")
+ 
+    close_pygame()
+
+# ── Timed message ─────────────────────────────────────────────────────────────
+def show_message(world, clock_ref, message):
+    """
+    Open a Pygame window, display `message` for MSG_DURATION seconds,
+    then close it. Keeps ticking the CARLA world while open.
+    """
+    screen, clock, _, font_msg = open_pygame_window()
+    t_start = time.time()
+ 
+    while time.time() - t_start < MSG_DURATION:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                break
+        draw_background(screen)
+        draw_text_centred(screen, font_msg, message, WHITE, MSG_SHADOW)
+        pygame.display.flip()
+        clock.tick(60)
+        world.tick()
+ 
+    close_pygame()
+    print(f"[message] '{message}' closed")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -1038,29 +1383,60 @@ def main():
     print("[TrafficLights] Setting all traffic lights to green...")
     set_all_traffic_lights_green(world)
 
+    horn_player    = HornPlayer(HORN_WAV)
+    horn_scheduler = HornScheduler(horn_player)
+
      # ── ADD THIS: Create crash detector ──
     crash_detector = SimpleCrashDetector(queue_manager)
 
     tm = client.get_trafficmanager(TM_PORT)
     tm.set_synchronous_mode(False)
     tm.set_random_device_seed(42)
-    tm.set_global_distance_to_leading_vehicle(5.0)
+    tm.set_global_distance_to_leading_vehicle(3.0)
 
     try:
-        # Congestion on lanes -1, -2, -3 (NPCController, physics ON)
         cong_vehicles = spawn_congestion_lanes(world, num_per_lane=25)
         all_npcs.extend([cv.npc for cv in cong_vehicles])
+        queue_manager.vehicles.extend([CongestionQueueVehicle(cv.npc, world, cv.ctrl.target_lane) for cv in cong_vehicles])
         world.tick()
 
         ego = find_ego_vehicle(world)
         precise_respawn(ego, EGO_SPAWN)
-        world.tick()
+        world.tick()        
+        
+        print("Starting countdown ...")
+        show_countdown(world)
         beep(world, ego.get_transform().location)
 
         # Construction zone on lane -4, 30m ahead of merge
         cones = spawn_obstacle(world)
         all_npcs.extend(cones)
         world.tick()
+
+        # Congestion on lanes -1, -2, -3 (NPCController, physics ON)
+        # cong_vehicles = spawn_congestion_lanes(world, num_per_lane=8)
+        # all_npcs.extend([cv.npc for cv in cong_vehicles])
+        # world.tick()
+
+        # A events
+        a_events = [
+            AEvent("A1", True,  DecelType.GRADUAL,    340.0, "vehicle.audi.tt"),
+        ]
+
+        # P events
+        p_events = [
+            PEvent("P1", True,  DecelType.RAPID,    160.0, "vehicle.audi.tt"),
+            PEvent("P2", True,  DecelType.RAPID,    260.0, "vehicle.audi.tt"),
+        ]
+
+         # Congestion cut-ins (pass queue_manager to each)
+        c_events = [
+            CongestionCutIn("C1", 200.0, queue_manager, solid_line=False, model="vehicle.dodge.charger_2020"),
+            CongestionCutIn("C2", 300.0, queue_manager, solid_line=False, model="vehicle.audi.tt"),
+        ]
+
+        congestion_spawned = False
+        recovery_started = False
 
         horn_vehicle = HornVehicle()
         monitor      = SpeedMonitor(world, ego)
@@ -1072,50 +1448,19 @@ def main():
         prompts_shown= set()
 
         prompt_schedule = {
-            65.0:  "Turn on the left signal and merge into the main lane.",
-            50.0:  "How much anger or frustration do you feel\ndue to the current traffic condition?",
-            185.0: "How much anger or frustration did you feel\ndue to the merging refusal situation?",
-            220.0: "Maintain a safe distance and follow the traffic speed.",
+            1.0:  "You are approaching a merge point with heavy traffic.\nPlease merge into the 3rd lane safely.",
+            10.0: "How much anger or frustration do you feel\ndue to the current traffic condition?",
+            15.0:  "Turn on the left signal and merge into the main lane.",
+            22.0: "How much anger or frustration do you feel\ndue to the merging refusal situation?",
+            28.0:  "Merge into the main lane when a gap appears.",
+            100.0:  "Maintain a safe distance and follow the traffic speed.",
+            160.0: "How much anger or frustration did you feel\ndue to the driving on the shoulder?",
+            215.0: "How much anger or frustration did you feel\ndue to the vehicle merging from the shoulder?",
+            260.0: "How much anger or frustration did you feel\ndue to the driving on the shoulder?",
+            315.0: "How much anger or frustration did you feel\ndue to the vehicle merging from the shoulder?",     
+            330.0: "Switch to innermost lane and maintain driving speed of 100-110 km/h.",
+            410.0: "How much anger or frustration did you feel\ndue to the slow vehicle blocking your lane?",
         }
-
-        prompted = set()
-        congestion_spawned = False
-        recovery_started = False
-        exit_road_reached = False
-
-        ORIGINAL_EGO_SPAWN = carla.Location(x=80.25, y=-348.11, z=0.23)
-
-        print(f"[Congestion] Pre-spawning queue at exit location...")
-
-        spawn_wp = world.get_map().get_waypoint(
-            ORIGINAL_EGO_SPAWN, project_to_road=True,
-            lane_type=carla.LaneType.Driving)
-
-        if spawn_wp:
-            lane4_wp = wp_in_lane(spawn_wp, -4) or spawn_wp
-            original_road = lane4_wp.road_id
-
-            test_prev = lane4_wp.previous(20.0)
-            test_next = lane4_wp.next(20.0)
-
-            if test_next and test_next[0].road_id == original_road:
-                step_func_name = "next"
-            elif test_prev and test_prev[0].road_id == original_road:
-                step_func_name = "previous"
-            else:
-                step_func_name = "previous"
-
-            print(f"[Congestion] Highway direction: {step_func_name}()")
-
-            if step_func_name == "next":
-                close = lane4_wp.previous(2.0)
-                cur_wp = close[0] if close else lane4_wp
-            else:
-                close = lane4_wp.next(2.0)
-                cur_wp = close[0] if close else lane4_wp
-
-            cur_wp = wp_in_lane(cur_wp, -4) or cur_wp
-
 
         print("\n[Step 3] Running. Ctrl+C to stop.\n")
 
@@ -1125,66 +1470,130 @@ def main():
 
             t, ego_spd = monitor.tick(FDS)
 
-            # Detect merge
-            if ego_has_merged(world, ego) and not merged:
-                merged = True
-                monitor.ramp_mode = False
-                print(f"[Merge] Ego merged at T={t:.1f}s  lane={ego_lane(world,ego)}")
+            horn_scheduler.update(t)
 
+            # ── ENSURE TRAFFIC LIGHTS STAY GREEN ────────────────────────────
+            # Check every few ticks to reduce performance impact
+            if tick_count % 50 == 0:  # Check every 10 ticks
+                keep_traffic_lights_green(world)
+
+            label = f"🚗 CONGESTION — 5-10 km/h (lane-3)"
             # ── Phase logic ───────────────────────────────────────────
-            if t < 100.0:
-                label = "Ramp — prepare to merge into lane 3"
-                # Keep all congestion crawling
+            if 1 < t < 15.0:
+                label = f"🚗 CONGESTION — 5-10 km/h (lane-3)"
+                
+                # Very slow speed: 5-10 km/h
+                target_speed = random.uniform(8, 10)
                 for cv in cong_vehicles:
-                    cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
+                    cv.update(target_speed)
 
-            elif 100.0 <= t < 160.0:
+            #-----Merege zone: all lanes congested, waiting for gap
+            elif 15.0 <= t < 30.0:
                 label = "Merge zone — all lanes congested, waiting for gap"
-                # Horn at 120s
-                if t >= 120.0 and not horn_spawned:
+                # Horn at 60s
+                if t >= 15.0 and not horn_spawned:
                     horn_vehicle.spawn(world, ego, tm)
                     horn_spawned = True
-                for cv in cong_vehicles:
-                    cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
 
-            elif 160.0 <= t < 180.0:
-                label = "Gap opening — merge now into lane 3!"
-                if not gap_opened:
+                # Very slow speed: 5-10 km/h
+                target_speed = random.uniform(8, 10)
+                queue_manager.update_all(target_speed)
+                # Other vehicles continue crawling while lane -3 vehicles speed up to 8-13 km/h to create a gap
+                for cv in cong_vehicles:
+                    if cv.ctrl.target_lane == -3 and is_alive(cv.npc):
+                        cv.update(random.uniform(20, 28))  # speed up to create a gap
+                    else:
+                        cv.update(target_speed)
+                # for cv in [c for c in cong_vehicles
+                #         if c.ctrl.target_lane == -3 and is_alive(c.npc)]:
+                #     cv.update(random.uniform(SPEED_CONG_MIN + 3.0, SPEED_CONG_MAX + 3.0))
+
+            #------Gap opening zone: slow down 2 vehicles in lane -3 to open a gap for ego
+            elif 30.0 <= t < 40.0:
+                 label = "Gap opening — merge now into lane 3!"
+                 if not gap_opened:
                     # Slow the 2 lane -3 vehicles nearest merge to open a gap
                     lane3 = [cv for cv in cong_vehicles
-                             if cv.ctrl.target_lane == -3 and is_alive(cv.npc)]
+                            if cv.ctrl.target_lane == -3 and is_alive(cv.npc)]
                     # Sort by distance to merge point to find nearest ones
                     lane3.sort(key=lambda cv: math.sqrt(
                         (cv.npc.get_transform().location.x - MERGE_LOCATION.x)**2 +
                         (cv.npc.get_transform().location.y - MERGE_LOCATION.y)**2))
                     for cv in lane3[:2]:
-                        cv.update(3.0)   # near-stop = visible gap
+                        cv.update(1.0)   # near-stop = visible gap
+                    
                     # Other vehicles continue crawling
                     for cv in [c for c in cong_vehicles
-                               if c.ctrl.target_lane != -3 or c not in lane3[:2]]:
+                            if c.ctrl.target_lane != -3 or c not in lane3[:2]]:
                         cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
                     gap_opened = True
                     print(f"[Gap] Opened in lane -3 at T={t:.1f}s")
-                else:
-                    for cv in cong_vehicles:
-                        cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
-
-            elif 180.0 <= t < 220.0:
-                label = "Stabilization — maintain 100-105 km/h"
+                 else:
+                     for cv in cong_vehicles:
+                         cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
+            
+            #----------stabilization zone: maintain 20-45 km/h
+            elif 40.0 <= t < 140.0:
+                label = "Stabilization — maintain 30-50 km/h"
                 for cv in cong_vehicles:
-                    cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
+                    cv.update(random.uniform(20, 30))
 
-            else:
+            #----------congestion phase: maintain 5-10 km/h
+            elif 140.0 <= t < 320.0:
                 label = "Proceed to congestion phase"
-                for cv in cong_vehicles:
-                    cv.update(random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX))
+                
+                # Very slow speed: 5-10 km/h
+                target_speed = random.uniform(SPEED_CONG_MIN, SPEED_CONG_MAX)
+                
+                # Update ALL queue vehicles (including cut-ins)
+                queue_manager.update_all(target_speed)
 
-            if horn_spawned:
-                horn_vehicle.update(world, ego, t)
+                # Update passes congestion cut-ins (they will join queue)
+                label = "Passes and congestion cutins"
+                for ev in p_events:
+                    lbl = ev.update(world, ego, t)
+                    if lbl:
+                        label = lbl
+                    if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
+                        all_npcs.append(ev.npc)
+                for ev in c_events:
+                    lbl = ev.update(world, ego, t)
+                    if lbl and "following" not in lbl:  # Don't spam "following" messages
+                        label = lbl
+                    if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
+                        all_npcs.append(ev.npc)
+
+            #----------recovery phase: maintain 100-110 km/h
+            elif 320.0 <= t < 325.0:
+                label = "Proceed to recovery phase"
+                progress = (t - 750.0) / 50.0
+                eased_progress = progress * progress * (3 - 2 * progress)
+                recovery_spd = SPEED_RECOVERY_MIN + eased_progress * 30
+                queue_manager.update_all(recovery_spd)
+            
+            #----------cut in blocking vehicle
+            elif t >= 325.0:
+                label = "Cut-in blocking vehicle"
+
+                #Remove queue vehicles to allow cut-in
+                for qv in queue_manager.vehicles[:]:
+                    if qv.alive and qv.npc and is_alive(qv.npc):
+                        print(f"[Queue] Removing vehicle {qv.npc.id} for cut-in")
+                        safe_destroy(qv.npc)
+                    qv.alive = False
+                    queue_manager.vehicles.remove(qv)
+
+                for ev in a_events:
+                    lbl = ev.update(world, ego, t)
+                    if lbl:
+                        label = lbl
+                    if ev.npc and ev.npc not in all_npcs and is_alive(ev.npc):
+                        all_npcs.append(ev.npc)
 
             for pt, msg in prompt_schedule.items():
                 if t >= pt and pt not in prompts_shown:
                     show_prompt(world, ego, msg)
+                    _speak(msg)
                     prompts_shown.add(pt)
 
             tick_count += 1
@@ -1201,7 +1610,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[Step 3] Stopped.")
     finally:
-        horn_vehicle.destroy()
+        # horn_vehicle.destroy()
         for npc in all_npcs: safe_destroy(npc)
         try:
             s=world.get_settings(); s.synchronous_mode=False
